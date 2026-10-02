@@ -14,6 +14,7 @@ one top-level trajectory per ``<session>_sub_<n>.jsonl`` object, one
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -155,6 +156,24 @@ def lineage_line(artifact: TrajectoryArtifact) -> bytes:
     """Encode one artifact's lineage record as a canonical JSONL line."""
 
     return dumps(artifact.lineage, sort_keys=True) + b"\n"
+
+
+def write_lineage_part(
+    artifacts: Iterable[TrajectoryArtifact], destination: str | Path
+) -> SparkObjectDescription:
+    """Write one executor-owned lineage part without collecting records."""
+
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    with target.open("wb") as handle:
+        for artifact in artifacts:
+            line = lineage_line(artifact)
+            handle.write(line)
+            digest.update(line)
+            size += len(line)
+    return SparkObjectDescription(target.name, digest.hexdigest(), size)
 
 
 def deterministic_s3_put(
@@ -344,4 +363,5 @@ __all__ = [
     "lineage_record",
     "merge_lineage_parts",
     "serialize_trajectory",
+    "write_lineage_part",
 ]
