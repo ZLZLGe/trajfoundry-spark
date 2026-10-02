@@ -171,6 +171,26 @@ def _download_part(client: Any, location: S3Location, relative_path: str, destin
             close()
 
 
+def _cleanup_stale_jsonl(
+    client: Any,
+    location: S3Location,
+    current_paths: set[str],
+) -> None:
+    """Remove only top-level JSONL objects not declared by the new manifest."""
+
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=location.bucket, Prefix=location.prefix):
+        for item in page.get("Contents", ()) or ():
+            key = item.get("Key")
+            if not isinstance(key, str) or not key.startswith(location.prefix):
+                continue
+            relative = key[len(location.prefix) :]
+            if "/" in relative or not relative.endswith(".jsonl"):
+                continue
+            if relative not in current_paths:
+                client.delete_object(Bucket=location.bucket, Key=key)
+
+
 def _merge_counts(accumulator: ManifestAccumulator, results: list[dict[str, Any]]) -> None:
     accumulator.stats.accepted += sum(int(item.get("accepted", 0)) for item in results)
     accumulator.stats.quarantined_trajectories += sum(
@@ -306,6 +326,11 @@ def run_spark_job(config: SparkNormalizeConfig, *, spark: Any | None = None) -> 
         content_type="application/json",
     )
     accumulator.add_object(manifest_description)
+    _cleanup_stale_jsonl(
+        client,
+        output_location,
+        {description.path for description in accumulator.objects},
+    )
     # The manifest describes itself in the existing v4 exporter only when it
     # is in the file list; publish it last but do not recurse while hashing.
     return {
