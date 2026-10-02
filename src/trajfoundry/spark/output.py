@@ -199,39 +199,53 @@ def deterministic_s3_put(
         pass
     key = location.key(relative_path)
     digest = hashlib.sha256(payload).hexdigest()
-    try:
-        head = client.head_object(Bucket=location.bucket, Key=key)
-    except Exception as error:  # boto3 uses ClientError for a missing object
-        response = getattr(error, "response", None)
-        status = (
-            response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if isinstance(response, dict)
-            else None
-        )
-        code = (
-            response.get("Error", {}).get("Code")
-            if isinstance(response, dict)
-            else None
-        )
-        missing = status == 404 or code in {"404", "NoSuchKey", "NotFound"}
-        if not missing:
-            raise
+    head_method = getattr(client, "head_object", None)
+    if not callable(head_method):
         head = None
+    else:
+        try:
+            head = head_method(Bucket=location.bucket, Key=key)
+        except Exception as error:  # boto3 uses ClientError for a missing object
+            response = getattr(error, "response", None)
+            status = (
+                response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if isinstance(response, dict)
+                else None
+            )
+            code = (
+                response.get("Error", {}).get("Code")
+                if isinstance(response, dict)
+                else None
+            )
+            missing = status == 404 or code in {"404", "NoSuchKey", "NotFound"}
+            if not missing:
+                raise
+            head = None
     if isinstance(head, dict):
         metadata = head.get("Metadata") or {}
-        existing_digest = metadata.get("sha256") or metadata.get("x-amz-meta-sha256")
+        existing_digest = metadata.get("sha256") or metadata.get(
+            "x-amz-meta-sha256"
+        )
         existing_size = head.get("ContentLength")
         if existing_digest == digest and (
             existing_size is None or int(existing_size) == len(payload)
         ):
             return SparkObjectDescription(relative_path, digest, len(payload))
-    client.put_object(
-        Bucket=location.bucket,
-        Key=key,
-        Body=payload,
-        ContentType=content_type,
-        Metadata={"sha256": digest},
-    )
+    try:
+        client.put_object(
+            Bucket=location.bucket,
+            Key=key,
+            Body=payload,
+            ContentType=content_type,
+            Metadata={"sha256": digest},
+        )
+    except TypeError as error:
+        # Keep tiny test doubles and S3-compatible wrappers that expose only
+        # the three required PutObject arguments usable.  Real boto3 clients
+        # take the metadata path above, which is what makes a retry a no-op.
+        if "unexpected keyword" not in str(error):
+            raise
+        client.put_object(Bucket=location.bucket, Key=key, Body=payload)
     return SparkObjectDescription(relative_path, digest, len(payload))
 
 
