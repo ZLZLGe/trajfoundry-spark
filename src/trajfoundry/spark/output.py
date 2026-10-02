@@ -66,6 +66,7 @@ class TrajectoryArtifact:
     filename: str
     payload: bytes
     origins: tuple[dict[str, Any], ...] = ()
+    representative: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.trajectory_id) != 64 or any(
@@ -91,6 +92,7 @@ class TrajectoryArtifact:
             trajectory_id=self.trajectory_id,
             payload=self.payload,
             origins=self.origins,
+            representative=self.representative,
         )
 
 
@@ -119,7 +121,13 @@ def serialize_trajectory(
             f"{len(payload)} > {max_bytes}"
         )
     copied_origins = tuple(dict(origin) for origin in origins)
-    return TrajectoryArtifact(identifier, filename, payload, copied_origins)
+    return TrajectoryArtifact(
+        identifier,
+        filename,
+        payload,
+        copied_origins,
+        node.metadata.source_file,
+    )
 
 
 def lineage_record(
