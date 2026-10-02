@@ -84,6 +84,17 @@ residue again and removes it after the replacement manifest is published. See
 [`docs/dolphinscheduler.md`](docs/dolphinscheduler.md) for normalization and
 classification workflow configuration.
 
+The independent Spark implementation for the TokenPlan workload is documented
+in [`docs/spark-tokenplan.md`](docs/spark-tokenplan.md). It is submitted from a
+DolphinScheduler SHELL task with `spark-submit --deploy-mode cluster`; the
+Driver and Executors therefore run in Kubernetes rather than inside the
+DolphinScheduler Worker. The no-snapshot path reads `req_*.json` in executor
+partitions, shuffles records by scope, builds one scope at a time, and writes
+the existing flat-v4 JSONL output. It does not persist Snapshot Parquet or a
+long-lived `spark-work` tree, but Spark may use executor-local disk for
+shuffle/spill. The original Python entry points remain available for other
+formats and as a rollback path.
+
 The input tree is read-only. A non-empty output directory requires `--resume`:
 
 ```bash
