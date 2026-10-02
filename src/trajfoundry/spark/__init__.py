@@ -6,5 +6,6 @@ only supplies the distributed execution boundary used by the Spark jobs.
 """
 
 from .config import SparkNormalizeConfig
+from .job import run_spark_job
 
-__all__ = ["SparkNormalizeConfig"]
+__all__ = ["SparkNormalizeConfig", "run_spark_job"]

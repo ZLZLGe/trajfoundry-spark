@@ -14,11 +14,11 @@ one top-level trajectory per ``<session>_sub_<n>.jsonl`` object, one
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal
 
 from ..canonical import trajectory_id
 from ..export import SCHEMA_VERSION, ExportStats, trajectory_filename
@@ -257,6 +257,64 @@ def deterministic_s3_put(
     return SparkObjectDescription(relative_path, digest, len(payload))
 
 
+def deterministic_s3_put_file(
+    client: Any,
+    location: S3Location,
+    relative_path: str,
+    path: str | Path,
+    *,
+    content_type: str = "application/jsonl",
+) -> SparkObjectDescription:
+    """Stream a local file to S3 while keeping driver memory bounded."""
+
+    source = Path(path)
+    digest_builder = hashlib.sha256()
+    size = 0
+    with source.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest_builder.update(chunk)
+            size += len(chunk)
+    digest = digest_builder.hexdigest()
+    key = location.key(relative_path)
+    try:
+        head = client.head_object(Bucket=location.bucket, Key=key)
+    except (AttributeError, NotImplementedError):
+        head = None
+    except Exception as error:  # boto3 uses ClientError for a missing object
+        response = getattr(error, "response", None)
+        status = (
+            response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if isinstance(response, dict)
+            else None
+        )
+        code = (
+            response.get("Error", {}).get("Code")
+            if isinstance(response, dict)
+            else None
+        )
+        if status != 404 and code not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+        head = None
+    if isinstance(head, dict):
+        metadata = head.get("Metadata") or {}
+        existing_digest = metadata.get("sha256") or metadata.get(
+            "x-amz-meta-sha256"
+        )
+        if existing_digest == digest and (
+            head.get("ContentLength") is None or int(head["ContentLength"]) == size
+        ):
+            return SparkObjectDescription(relative_path, digest, size)
+    with source.open("rb") as handle:
+        client.put_object(
+            Bucket=location.bucket,
+            Key=key,
+            Body=handle,
+            ContentType=content_type,
+            Metadata={"sha256": digest},
+        )
+    return SparkObjectDescription(relative_path, digest, size)
+
+
 def merge_lineage_parts(
     parts: Sequence[str | Path], destination: str | Path, *, sort_parts: bool = True
 ) -> SparkObjectDescription:
@@ -381,6 +439,7 @@ __all__ = [
     "SparkObjectDescription",
     "TrajectoryArtifact",
     "deterministic_s3_put",
+    "deterministic_s3_put_file",
     "lineage_line",
     "lineage_record",
     "merge_lineage_parts",

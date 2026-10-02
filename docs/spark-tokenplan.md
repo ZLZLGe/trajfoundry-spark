@@ -30,8 +30,15 @@ spark-submit \
   --input-uri s3://agent-trajectory/lakehouse/token-plan/masked-raw/v002/dt=2026-09-16/ \
   --output-uri s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=2026-09-16/ \
   --input-format tokenplan \
-  --endpoint-url http://d-ceph-ssd-inside.pjlab.org.cn
+  --endpoint-url http://d-ceph-ssd-inside.pjlab.org.cn \
+  --prefix-shard 00/ \
+  --prefix-shard 01/ \
+  --prefix-shard 02/
 ```
+
+`--prefix-shard` 必须覆盖输入前缀下的实际目录分片；不要只传一个空字符串，否则
+所有对象会集中到一个 Spark task。分片应按 TokenPlan 的实际 key 目录填写（例如
+日期目录下的哈希前缀）。
 
 平台的 Kubernetes namespace、ServiceAccount、队列、Spark 镜像、pod template 和上传路径应从公司调度平台配置注入，不要把凭据或 kubeconfig 写进仓库。Cluster 模式是必要条件：Client 模式会把 Driver 留在 DolphinScheduler Worker 上，重新受到 Worker 内存限制。
 
@@ -57,7 +64,7 @@ s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=YYYY-MM-DD/
 
 ## 内存和失败边界
 
-Driver 只保存小型输出描述和统计信息，禁止 `collect()`、`toPandas()` 或缓存整日原始数据。`mapPartitions` 一次只保留当前 scope，scope 完成后立即释放。极大的单一 session/user scope 仍可能导致单个 task OOM，需要在作业中监控和隔离。
+Driver 只保存小型输出描述和统计信息；代码不会 `collect()` Snapshot/Trajectory 数据，只有每个分区的文件描述和计数会回到 Driver。不会调用 `toPandas()` 或缓存整日原始数据。`mapPartitions` 一次只保留当前 scope，scope 完成后立即释放。极大的单一 session/user scope 仍可能导致单个 task OOM，需要在作业中监控和隔离。
 
 不保存 Snapshot 的代价是：构建或发布阶段失败后必须从原始 S3 重新读取和解析；它减少了中间 I/O，但不是 OOM 的根本修复。真正的内存边界来自 Cluster 模式、scope 分区、无全量收集和足够的 `memoryOverhead`。
 

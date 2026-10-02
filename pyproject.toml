@@ -12,6 +12,11 @@ dependencies = [
   "zstandard>=0.23.0,<1.0.0",
 ]
 
+[project.optional-dependencies]
+spark = [
+  "pyspark>=3.5.0,<3.6.0",
+]
+
 [project.scripts]
 trajfoundry = "trajfoundry.cli:app"
 
