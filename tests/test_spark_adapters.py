@@ -76,7 +76,9 @@ def test_parse_payload_returns_one_bounded_shuffle_record() -> None:
 
 
 def test_parse_payload_is_deterministic_for_same_source_bytes() -> None:
-    payload = json.dumps(_tokenplan_envelope(session_id="session-deterministic")).encode()
+    payload = json.dumps(
+        _tokenplan_envelope(session_id="session-deterministic")
+    ).encode()
 
     first = parse_payload("req.json", payload, input_format="tokenplan")
     second = parse_payload("req.json", payload, input_format="tokenplan")
@@ -98,6 +100,37 @@ def test_parse_payload_preserves_user_scope_when_session_is_missing() -> None:
     assert row.scope_id == "user-7"
     assert row.session_id == ""
     assert row.user_id == "user-7"
+
+
+@pytest.mark.parametrize("session_id", ["", "no_session_id"])
+@pytest.mark.parametrize("user_id", ["alice", "bob", "", "no_user_id"])
+def test_session_sentinel_uses_exact_user_shuffle_scope(session_id, user_id) -> None:
+    envelope = _tokenplan_envelope(session_id=session_id)
+    envelope["metadata"]["source_user_id"] = user_id
+    row = parse_payload(
+        "not-an-identity/no_session_id/req.json",
+        json.dumps(envelope).encode(),
+        input_format="tokenplan",
+    )
+    assert (row.scope_kind, row.scope_id) == ("user", user_id)
+    assert row.session_id == ""
+    assert json.loads(row.snapshot_json)["session_id"] == ""
+    assert row.user_id == user_id
+
+
+def test_real_request_session_overrides_envelope_sentinel_before_shuffle() -> None:
+    envelope = _tokenplan_envelope(session_id="no_session_id")
+    envelope["metadata"]["source_user_id"] = "alice"
+    envelope["client_request"]["capture"]["body"]["metadata"] = {
+        "session_id": "body-real"
+    }
+    row = parse_payload(
+        "no_session_id/req.json",
+        json.dumps(envelope).encode(),
+        input_format="tokenplan",
+    )
+    assert (row.scope_kind, row.scope_id) == ("session", "body-real")
+    assert row.session_id == "body-real"
 
 
 def test_parse_payload_exposes_stable_tokenplan_error() -> None:

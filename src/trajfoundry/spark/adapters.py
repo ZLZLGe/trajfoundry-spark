@@ -6,9 +6,9 @@ import hashlib
 from collections.abc import Mapping
 from typing import Any, Literal
 
-import orjson
-
+from ..identity import normalize_session_id
 from ..io import decode_capture
+from ..json_codec import dumps as json_dumps
 from ..pipeline import parse_capture
 from ..sources.deepinfra import adapt_deepinfra_envelope
 from ..sources.sxf import adapt_sxf_envelope
@@ -19,11 +19,13 @@ InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
 
 
 def _scope_fields(snapshot: Any) -> tuple[str, str]:
-    session_id = snapshot.session_id or ""
+    session_id = normalize_session_id(snapshot.session_id)
     user_id = snapshot.user_id or ""
     if session_id:
         return "session", session_id
-    return "user", user_id or "no_user_id"
+    # Keep missing users distinct from a literal user named "no_user_id".
+    # Public placeholders belong in final output, not in shuffle identities.
+    return "user", user_id
 
 
 def parse_payload(
@@ -84,12 +86,12 @@ def parse_payload(
         sha256=digest,
         scope_kind=scope_kind,
         scope_id=scope_id,
-        session_id=snapshot.session_id or "",
+        session_id=normalize_session_id(snapshot.session_id),
         user_id=snapshot.user_id or "",
         thread_id=snapshot.thread_id or "",
         captured_at=captured_at,
         endpoint=endpoint,
-        snapshot_json=orjson.dumps(snapshot.model_dump(mode="json"), option=orjson.OPT_SORT_KEYS),
+        snapshot_json=json_dumps(snapshot.model_dump(mode="json"), sort_keys=True),
     )
 
 

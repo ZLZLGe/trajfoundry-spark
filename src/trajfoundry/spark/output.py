@@ -27,6 +27,7 @@ from ..models import QuarantineRecord, TrajectoryNode
 from ..output_contract import project_trajectory
 from ..quality import is_strict_sample, validate_derived_fields
 from ..s3 import S3Location
+from .paths import validate_flat_output_name, validate_output_name
 
 InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
 
@@ -37,7 +38,8 @@ class SparkObjectDescription:
 
     ``path`` is relative to the output :class:`~trajfoundry.s3.S3Location` and
     is the only path included in a v4 manifest.  Keeping this object immutable
-    makes collecting small metadata records on the driver safe and explicit.
+    makes metadata transfer explicit. The total remains O(output objects);
+    the job applies admission limits rather than claiming bounded collection.
     """
 
     path: str
@@ -45,8 +47,7 @@ class SparkObjectDescription:
     bytes: int
 
     def __post_init__(self) -> None:
-        if not self.path or self.path.startswith("/") or "/" in self.path:
-            raise ValueError("Spark output paths must be flat relative names")
+        validate_output_name(self.path)
         if len(self.sha256) != 64 or any(
             char not in "0123456789abcdef" for char in self.sha256
         ):
@@ -117,8 +118,7 @@ def serialize_trajectory(
     payload = dumps(projected, sort_keys=True) + b"\n"
     if max_bytes is not None and len(payload) > max_bytes:
         raise ValueError(
-            "trajectory JSONL object exceeds max_bytes: "
-            f"{len(payload)} > {max_bytes}"
+            f"trajectory JSONL object exceeds max_bytes: {len(payload)} > {max_bytes}"
         )
     copied_origins = tuple(dict(origin) for origin in origins)
     return TrajectoryArtifact(
@@ -231,9 +231,7 @@ def deterministic_s3_put(
             head = None
     if isinstance(head, dict):
         metadata = head.get("Metadata") or {}
-        existing_digest = metadata.get("sha256") or metadata.get(
-            "x-amz-meta-sha256"
-        )
+        existing_digest = metadata.get("sha256") or metadata.get("x-amz-meta-sha256")
         existing_size = head.get("ContentLength")
         if existing_digest == digest and (
             existing_size is None or int(existing_size) == len(payload)
@@ -297,9 +295,7 @@ def deterministic_s3_put_file(
         head = None
     if isinstance(head, dict):
         metadata = head.get("Metadata") or {}
-        existing_digest = metadata.get("sha256") or metadata.get(
-            "x-amz-meta-sha256"
-        )
+        existing_digest = metadata.get("sha256") or metadata.get("x-amz-meta-sha256")
         if existing_digest == digest and (
             head.get("ContentLength") is None or int(head["ContentLength"]) == size
         ):
@@ -349,7 +345,7 @@ def merge_lineage_parts(
 
 @dataclass
 class ManifestAccumulator:
-    """Driver-side accumulator for small object metadata and quality counters."""
+    """Driver-side O(output objects) metadata; callers must enforce admission limits."""
 
     input_root: str
     input_format: InputFormat
@@ -361,6 +357,8 @@ class ManifestAccumulator:
     _lineage_records: int = field(default=0, init=False)
 
     def add_object(self, description: SparkObjectDescription) -> None:
+        # Nested sidecar descriptors are valid task receipts, not v4 data files.
+        validate_flat_output_name(description.path)
         existing = self._objects.get(description.path)
         if existing is not None and existing != description:
             raise ValueError(f"conflicting output object metadata: {description.path}")

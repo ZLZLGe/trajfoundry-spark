@@ -26,6 +26,7 @@ from .canonical import (
     trajectory_id,
 )
 from .export import SCHEMA_VERSION, OutputSet
+from .identity import normalize_session_id
 from .io import CaptureSource, LocalCaptureSource, decode_capture
 from .models import (
     AgentMessageRecord,
@@ -62,7 +63,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-09-28.1"
+NORMALIZER_REVISION = "2026-10-10.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -683,6 +684,7 @@ def _source_file_and_line(source_path: str) -> tuple[str, int]:
 def _trajectory_from_leaf(
     leaf: Snapshot, contributors: Iterable[Snapshot]
 ) -> TrajectoryNode:
+    session_id = normalize_session_id(leaf.session_id)
     contributor_list = list(contributors)
     if not any(item.source_path == leaf.source_path for item in contributor_list):
         contributor_list.append(leaf)
@@ -708,7 +710,7 @@ def _trajectory_from_leaf(
                 detail="missing user id was published as no_user_id",
             )
         )
-    if not leaf.session_id:
+    if not session_id:
         synthesized_identity_issues.append(
             AuditIssue(
                 code="metadata_session_id_synthesized",
@@ -769,7 +771,7 @@ def _trajectory_from_leaf(
             created_at=leaf.captured_at,
             model=leaf.model,
             user_id=leaf.user_id or "no_user_id",
-            session_id=leaf.session_id or "no_session_id",
+            session_id=session_id or "no_session_id",
             source_type=source_type,
             specific_source=specific_source,
         ),

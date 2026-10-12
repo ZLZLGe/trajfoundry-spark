@@ -15,43 +15,61 @@ def _config(**overrides: object) -> SparkNormalizeConfig:
     return SparkNormalizeConfig(**values)
 
 
-def test_initial_profile_is_cluster_mode_and_has_bounded_s3_concurrency() -> None:
+def test_defaults_preserve_submit_resources_and_client_mode() -> None:
     config = _config(endpoint_url="http://ceph.example")
 
     settings = config.spark_conf()
 
-    assert settings["spark.submit.deployMode"] == "cluster"
-    assert settings["spark.executor.instances"] == "24"
-    assert settings["spark.executor.cores"] == "4"
-    assert settings["spark.executor.memoryOverhead"] == "8g"
-    assert settings["spark.sql.adaptive.enabled"] == "true"
-    assert settings["spark.dynamicAllocation.enabled"] == "false"
-    assert settings["spark.hadoop.fs.s3a.connection.maximum"] == "32"
-    assert settings["spark.hadoop.fs.s3a.threads.max"] == "16"
-    assert settings["spark.hadoop.fs.s3a.fast.upload.buffer"] == "disk"
-    assert settings["spark.hadoop.fs.s3a.endpoint"] == "http://ceph.example"
-    assert settings["spark.hadoop.fs.s3a.path.style.access"] == "true"
-    assert settings["spark.hadoop.fs.s3a.connection.ssl.enabled"] == "false"
-    assert config.total_executor_cores == 96
+    assert settings == {}
+    assert config.total_executor_cores is None
 
 
-def test_config_requires_explicit_prefix_shards_to_avoid_driver_listing() -> None:
+def test_only_explicit_resource_overrides_are_emitted() -> None:
+    config = _config(executor_instances=1, executor_cores=2, shuffle_partitions=3)
+    assert config.spark_conf() == {
+        "spark.executor.instances": "1",
+        "spark.executor.cores": "2",
+        "spark.sql.shuffle.partitions": "3",
+    }
+    assert config.total_executor_cores == 2
+
+
+def test_config_requires_explicit_or_automatic_prefix_shards() -> None:
     with pytest.raises(ValueError, match="prefix_shards"):
         SparkNormalizeConfig(
-            input_uri="s3://bucket/input",
-            output_uri="s3://bucket/output",
+            input_uri="s3://bucket/input/",
+            output_uri="s3://bucket/output/",
         )
+    config = SparkNormalizeConfig(
+        input_uri="s3://bucket/input/",
+        output_uri="s3://bucket/output/",
+        auto_prefix_shards=True,
+    )
+    assert config.auto_prefix_shards is True
+
+
+def test_config_rejects_mixing_explicit_and_automatic_prefix_discovery() -> None:
+    with pytest.raises(ValueError, match="omitted"):
+        _config(prefix_shards=("user/",), auto_prefix_shards=True)
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("input_uri", "/local/input", "input_uri"),
-        ("output_uri", "/local/output", "output_uri"),
+        ("output_uri", "relative/output", "absolute local path"),
         ("input_format", "unknown", "unsupported input format"),
         ("prefix_shards", ("/absolute/",), "relative prefixes"),
         ("executor_cores", 0, "executor_cores"),
         ("shuffle_partitions", -1, "shuffle_partitions"),
+        ("max_output_objects", 0, "max_output_objects"),
+        ("max_prefix_shards", 0, "max_prefix_shards"),
+        ("max_partition_objects", -1, "max_partition_objects"),
+        ("input_credentials_path", "relative/credentials.json", "absolute path"),
+        ("output_credentials_path", "relative/credentials.json", "absolute path"),
+        ("prefix_shards", ("../",), "relative prefixes"),
+        ("prefix_shards", ("47/", "47/"), "repeat or overlap"),
+        ("prefix_shards", ("47", "477100353/"), "repeat or overlap"),
     ],
 )
 def test_config_rejects_unsafe_or_invalid_values(
@@ -64,3 +82,13 @@ def test_config_rejects_unsafe_or_invalid_values(
 def test_config_accepts_all_supported_input_formats() -> None:
     for input_format in ("tokenplan", "freerouter", "deepinfra", "sxf"):
         assert _config(input_format=input_format).input_format == input_format
+
+
+def test_credentials_path_is_not_a_spark_configuration_value() -> None:
+    config = _config(
+        input_credentials_path="/shared/private/credentials.json",
+        output_credentials_path="/shared/private/output.json",
+    )
+    assert config.input_credentials_path == "/shared/private/credentials.json"
+    assert config.output_credentials_path == "/shared/private/output.json"
+    assert config.spark_conf() == {}
