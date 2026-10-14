@@ -43,12 +43,13 @@ def test_status_failure_is_sanitized():
     assert "secret-value" not in json.dumps(value)
 
 
-def test_phase_emits_parseable_progress(capsys):
+@pytest.mark.parametrize("phase", ["build_publish", "byte_chunk_plan"])
+def test_phase_emits_parseable_progress(capsys, phase):
     reporter = SparkProgressReporter(SimpleNamespace(statusTracker=lambda: Tracker()))
-    reporter.set_phase("build_publish")
+    reporter.set_phase(phase)
     output = capsys.readouterr().out
     assert output.startswith("TF_SPARK_PROGRESS ")
-    assert json.loads(output.partition(" ")[2])["phase"] == "build_publish"
+    assert json.loads(output.partition(" ")[2])["phase"] == phase
     with pytest.raises(ValueError, match="unknown"):
         reporter.set_phase("secret")
 

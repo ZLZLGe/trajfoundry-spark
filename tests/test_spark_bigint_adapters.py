@@ -157,7 +157,8 @@ def test_parse_payload_preserves_exact_tool_arguments_and_schema_integers(
     )
 
     assert row.sha256 == hashlib.sha256(payload).hexdigest()
-    assert (row.scope_kind, row.scope_id) == ("user", "user-1")
+    assert row.scope_kind == "user"
+    assert row.scope_id == "user-1"
     assert parse_payload(row.source_ref, payload, input_format="tokenplan") == row
     # Check the wire bytes independently, then the same Snapshot validation
     # used after Spark shuffle. Neither route may turn exact integers into floats.

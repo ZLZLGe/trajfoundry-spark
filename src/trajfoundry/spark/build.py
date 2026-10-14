@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..canonical import trajectory_id
-from ..identity import normalize_session_id
+from ..identity import aggregation_scope, normalize_session_id
 from ..models import AuditIssue, Snapshot, TrajectoryNode
 from ..pipeline import (
     _accept_local_relay_mount,
@@ -99,16 +99,34 @@ def _materialize(
 
 
 def build_scope(snapshots: Iterable[Snapshot]) -> tuple[BuiltTrajectory, ...]:
-    """Aggregate one session/user scope with the same semantics as the local pipeline.
+    """Aggregate session/user-chunk scopes with local-pipeline semantics.
 
     The scope is intentionally the unit shuffled by Spark.  It is bounded by
-    one session (or one no-session user bucket), and no SQLite snapshot is
-    created or persisted.
+    one session (or one no-session user/chunk), and no SQLite snapshot is
+    created or persisted. Direct callers may supply multiple scopes; separate
+    them before prefix aggregation and subagent planning.
     """
 
     all_snapshots = {snapshot.source_path: snapshot for snapshot in snapshots}
     if not all_snapshots:
         return ()
+    scopes: dict[tuple[str, str], list[Snapshot]] = defaultdict(list)
+    for snapshot in all_snapshots.values():
+        scopes[
+            aggregation_scope(
+                snapshot.session_id,
+                snapshot.user_id,
+                snapshot.captured_at,
+                snapshot.sessionless_chunk_id,
+            )
+        ].append(snapshot)
+    if len(scopes) > 1:
+        return tuple(
+            sorted(
+                (item for scope in scopes.values() for item in build_scope(scope)),
+                key=lambda item: trajectory_id(item.node),
+            )
+        )
     ordered_snapshots = tuple(sorted(all_snapshots.values(), key=_snapshot_order_key))
     result = streaming_prefix_leaves(
         snapshot for snapshot in ordered_snapshots if _eligible(snapshot)

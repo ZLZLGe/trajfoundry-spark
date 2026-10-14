@@ -1,8 +1,9 @@
 """Conservative, constant-size planning hints for parallel missing-session scopes.
 
-These are *prefix components*, not request buckets: every pair that can merge
-must retain the same component key.  Protocol, thread, request id and timestamps
-must never be used as independent split boundaries for a missing-session user.
+These are *prefix components* inside the previously established session or
+missing-session user/byte-chunk scope: every pair that can merge within that
+scope must retain the same component key. Protocol, thread and request id must
+never introduce additional split boundaries inside a missing-session byte chunk.
 """
 
 from __future__ import annotations
@@ -115,7 +116,7 @@ def component_key(snapshot: Snapshot, summary: ScopeComponentSummary) -> str:
     finally deduplicate also share this key.  Hash collisions merely coalesce
     components; equality is still established by the downstream builder.
 
-    The caller must reduce all captures in the original session/user scope
+    The caller must reduce all captures in the established session/user-byte-chunk scope
     before invoking this function.  Never derive the summary from a sample or
     a partition-local subset.  Missing/oversized summary maps should fall back
     to the whole-scope builder, not to an assumed safe default.

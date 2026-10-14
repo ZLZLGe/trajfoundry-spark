@@ -6,6 +6,29 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from .window_identity import sessionless_window  # noqa: F401 - legacy reader export
+
+
+def aggregation_scope(
+    session_id: str, user_id: str, captured_at: str, sessionless_chunk_id: str = ""
+) -> tuple[str, str]:
+    """Select a real session or a planner-assigned missing-session user chunk.
+
+    ``captured_at`` remains accepted for callers and legacy window readers,
+    but a timestamp no longer introduces a hidden aggregation boundary.
+    """
+
+    session_id = normalize_session_id(session_id)
+    if session_id:
+        return "session", session_id
+    user_id = user_id or ""
+    if sessionless_chunk_id:
+        # JSON encoding retains exact user identity without delimiter collisions.
+        return "user_chunk", json.dumps(
+            [user_id, sessionless_chunk_id], ensure_ascii=False, separators=(",", ":")
+        )
+    return "user", user_id
+
 
 def normalize_session_id(value: object) -> str:
     """Treat the public missing-session sentinel as missing at input boundaries."""

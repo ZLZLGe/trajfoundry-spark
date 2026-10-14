@@ -189,7 +189,8 @@ def _install_v004_input(client: _MemoryS3, location: S3Location) -> bytes:
         orjson.dumps(
             {
                 "trajectory_id": trajectory_id(
-                    parse_trajectory_record(value, allow_legacy_metadata=True)
+                    parse_trajectory_record(value, allow_legacy_metadata=True),
+                    sessionless_window_hours=0,
                 ),
                 "representative": value["source"],
                 "origin_count": 1,
@@ -243,7 +244,13 @@ def _install_v004_input(client: _MemoryS3, location: S3Location) -> bytes:
     return manifest_bytes
 
 
-def _install_v4_input(client: _MemoryS3, location: S3Location) -> bytes:
+def _install_v4_input(
+    client: _MemoryS3,
+    location: S3Location,
+    *,
+    sessionless_window_hours: int = 0,
+    sessionless_partitioning: str | None = None,
+) -> bytes:
     legacy_manifest = orjson.loads(_install_v004_input(client, location))
     rows: list[dict[str, Any]] = []
     lineage = b""
@@ -254,17 +261,30 @@ def _install_v4_input(client: _MemoryS3, location: S3Location) -> bytes:
         else:
             rows.extend(orjson.loads(line) for line in payload.splitlines())
     sub_sessions = {"earlier.json": 0, "later.json": 1, "missing.json": 0}
-    new_objects: dict[str, bytes] = {"lineage.jsonl": lineage}
+    new_objects: dict[str, bytes] = {}
+    identifiers: dict[str, str] = {}
     for row in rows:
         sub_session_id = sub_sessions[row["source"]]
         row["metadata"]["sub_session_id"] = sub_session_id
+        if sessionless_partitioning and row["source"] == "missing.json":
+            row["metadata"]["sessionless_chunk_id"] = "a" * 64
+        identifier = trajectory_id(
+            parse_trajectory_record(row),
+            sessionless_window_hours=sessionless_window_hours,
+        )
+        identifiers[row["source"]] = identifier
         if row["source"] == "missing.json":
-            identifier = trajectory_id(parse_trajectory_record(row))
             filename = f"no_session_id_{identifier}_sub_0.jsonl"
         else:
             filename = f"session-A_sub_{sub_session_id}.jsonl"
         new_objects[filename] = orjson.dumps(row) + b"\n"
 
+    lineage_rows = [orjson.loads(line) for line in lineage.splitlines()]
+    for row in lineage_rows:
+        row["trajectory_id"] = identifiers[row["representative"]]
+    new_objects["lineage.jsonl"] = b"".join(
+        orjson.dumps(row) + b"\n" for row in lineage_rows
+    )
     for key in [
         key
         for bucket, key in client.objects
@@ -276,6 +296,11 @@ def _install_v4_input(client: _MemoryS3, location: S3Location) -> bytes:
     manifest = {
         **legacy_manifest,
         "schema_version": "trajfoundry-v4",
+        **({"sessionless_window_hours": 8} if sessionless_window_hours else {}),
+        **(
+            {"sessionless_partitioning": sessionless_partitioning}
+            if sessionless_partitioning else {}
+        ),
         "files": [_entry(path, payload) for path, payload in new_objects.items()],
     }
     manifest_bytes = orjson.dumps(manifest, option=orjson.OPT_SORT_KEYS)
@@ -725,11 +750,24 @@ def test_late_configuration_error_does_not_change_published_output(
     )
 
 
-def test_v4_flat_input_is_classified_without_renumbering(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "sessionless_window_hours,sessionless_partitioning",
+    [(0, None), (8, None), (0, "normalized-bytes-v1")],
+)
+def test_v4_flat_input_is_classified_without_renumbering(
+    tmp_path: Path,
+    sessionless_window_hours: int,
+    sessionless_partitioning: str | None,
+) -> None:
     client = _MemoryS3()
     input_location = S3Location("bucket", "normalized/v005/dt=2026-09-14/")
     output_location = S3Location("bucket", "classified/v001/dt=2026-09-14/")
-    manifest_bytes = _install_v4_input(client, input_location)
+    manifest_bytes = _install_v4_input(
+        client,
+        input_location,
+        sessionless_window_hours=sessionless_window_hours,
+        sessionless_partitioning=sessionless_partitioning,
+    )
     completion = _Completion()
     classifier = TrajectoryClassifier(
         client=completion,
@@ -755,10 +793,24 @@ def test_v4_flat_input_is_classified_without_renumbering(tmp_path: Path) -> None
         entry["path"] for entry in manifest["files"] if entry["kind"] == "trajectory"
     }
     assert {"session-A_sub_0.jsonl", "session-A_sub_1.jsonl"} <= paths
+    assert manifest.get("sessionless_window_hours", 0) == sessionless_window_hours
+    assert manifest.get("sessionless_partitioning") == sessionless_partitioning
+    input_manifest = orjson.loads(manifest_bytes)
+    assert paths == {
+        entry["path"]
+        for entry in input_manifest["files"]
+        if entry["path"] != "lineage.jsonl"
+    }
+    assert (
+        client.objects[(output_location.bucket, output_location.key("lineage.jsonl"))]
+        == client.objects[(input_location.bucket, input_location.key("lineage.jsonl"))]
+    )
     for path in paths:
         row = orjson.loads(
             client.objects[(output_location.bucket, output_location.key(path))]
         )
+        if path.startswith("no_session_id_") and sessionless_partitioning:
+            assert row["metadata"]["sessionless_chunk_id"] == "a" * 64
         if path.startswith("session-A_sub_"):
             assert row["metadata"]["sub_session_id"] == int(
                 path.removesuffix(".jsonl").rsplit("_", 1)[1]

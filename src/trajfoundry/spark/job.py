@@ -7,8 +7,8 @@ import importlib
 import logging
 import os
 import resource
-import sqlite3
 import socket
+import sqlite3
 import tempfile
 import time
 import uuid
@@ -21,6 +21,8 @@ from typing import Any
 import orjson
 from pydantic import ValidationError
 
+from ..feedback import unix_ms
+from ..identity import aggregation_scope
 from ..json_codec import dumps, loads
 from ..models import Snapshot
 from ..output_contract import project_quarantine_record
@@ -141,15 +143,21 @@ def _runtime_consistency_handshake(context: Any) -> dict[str, Any]:
     # result bounded.  Spark does not expose a reliable executor enumeration
     # API; a task that runs on a stale executor is sufficient to fail fast.
     partitions = max(1, int(context.defaultParallelism))
-    reports = context.parallelize(range(partitions), partitions).mapPartitions(
-        lambda part: _executor_runtime_identity(
-            part,
-            expected["normalizer_revision"],
-            expected["source_hash"],
+    reports = (
+        context.parallelize(range(partitions), partitions)
+        .mapPartitions(
+            lambda part: _executor_runtime_identity(
+                part,
+                expected["normalizer_revision"],
+                expected["source_hash"],
+            )
         )
-    ).collect()
+        .collect()
+    )
     if not reports:
-        raise RuntimeError("Spark code consistency handshake produced no executor reports")
+        raise RuntimeError(
+            "Spark code consistency handshake produced no executor reports"
+        )
     mismatches = [
         report
         for report in reports
@@ -282,6 +290,84 @@ def _component_sort_key(item, summaries):
     return (*scope, component, value[7], value[0]), item
 
 
+def _scope_byte_summary(item):
+    from .byte_plan import record_order_key
+
+    scope, summary = _component_summary(item)
+    value = item[1]
+    return scope, (
+        summary,
+        len(value[-1]),
+        record_order_key(value[7], value[0], value[1]),
+    )
+
+
+def _merge_byte_summaries(left, right):
+    from .component_plan import merge_summaries
+
+    return (
+        merge_summaries(left[0], right[0]),
+        left[1] + right[1],
+        min(left[2], right[2]),
+    )
+
+
+def _byte_metadata(item):
+    from .byte_plan import ByteRecordMetadata
+
+    scope, (summary, size, order_key) = _scope_byte_summary(item)
+    return (scope, order_key), ByteRecordMetadata(scope, order_key, size, summary)
+
+
+def _metadata_partition(key):
+    from pyspark.rdd import portable_hash
+
+    return portable_hash(key[0])
+
+
+def _planned_component_sort_key(item, chunk_indexes, summaries):
+    """Route cached bodies using sparse metadata boundaries, without re-encoding."""
+    from .byte_plan import find_chunk, record_order_key
+    from .component_plan import component_key
+
+    scope, _ = _key_parsed(item)
+    if item[0] == "error":
+        return (*scope, "whole", (1, "", item[1]["source_ref"], "")), item
+    value = item[1]
+    order_key = record_order_key(value[7], value[0], value[1])
+    if scope[0] == "user":
+        chunk = find_chunk(chunk_indexes[scope], order_key)
+        scope = aggregation_scope("", scope[1], "", chunk.chunk_id)
+        # Keep the existing tuple contract. The snapshot chunk marker is added
+        # only at the builder boundary, avoiding a full JSON re-serialization.
+        value = (*value[:2], *scope, *value[4:])
+        item = "ok", value
+    snapshot = Snapshot.model_validate_json(value[-1])
+    component = component_key(snapshot, summaries[scope])
+    return (*scope, component, order_key), item
+
+
+def _planned_partition(key, assignments):
+    partition = assignments.get(key[:2])
+    return _scope_partition(key) if partition is None else partition
+
+
+def _admit_scope_plan(count, size, config):
+    if count > config.max_scope_summaries:
+        raise RuntimeError("scope summary count limit exceeded; no manifest published")
+    if size > config.max_scope_summary_bytes:
+        raise RuntimeError("scope summary byte limit exceeded; no manifest published")
+
+
+def _sum_pair(left, right):
+    return left[0] + right[0], left[1] + right[1]
+
+
+def _chunk_plan_size(chunk):
+    # Bound the broadcast plan before collecting boundaries onto the Driver.
+    return len(dumps([chunk.scope, chunk.first_key, chunk.chunk_id])) + 512
+
+
 def _scope_partition(key):
     from pyspark.rdd import portable_hash
 
@@ -325,10 +411,13 @@ def _build_partition(
                     spilled = True
                     break
 
-            def snapshots(probe=probe, iterator=iterator):
+            chunk_id = loads(scope[1])[1] if scope[0] == "user_chunk" else ""
+
+            def snapshots(probe=probe, iterator=iterator, chunk_id=chunk_id):
                 nonlocal count
                 for _kind, value in chain(probe, iterator):
                     snapshot = Snapshot.model_validate_json(value[-1])
+                    snapshot.sessionless_chunk_id = chunk_id
                     count += 1
                     record = _snapshot_record(snapshot)
                     if record is not None:
@@ -624,7 +713,9 @@ def _merge_counts(
             )
 
 
-def _resolve_prefix_shards(context: Any, config: SparkNormalizeConfig) -> tuple[str, ...]:
+def _resolve_prefix_shards(
+    context: Any, config: SparkNormalizeConfig
+) -> tuple[str, ...]:
     """Resolve explicit or executor-discovered input shards."""
 
     if not config.auto_prefix_shards:
@@ -633,22 +724,22 @@ def _resolve_prefix_shards(context: Any, config: SparkNormalizeConfig) -> tuple[
     # closure, just like ordinary shard reads. Only a bounded list of
     # immediate user prefixes crosses back to the Driver; object keys and
     # payloads never do.
-    discovered = context.parallelize([None], 1).mapPartitions(
-        lambda _part: discover_prefix_shards(
-            config.input_uri,
-            input_format=config.input_format,
-            endpoint_url=config.endpoint_url,
-            region_name=config.region_name,
-            input_credentials_path=config.input_credentials_path,
-            max_prefix_shards=config.max_prefix_shards,
+    discovered = (
+        context.parallelize([None], 1)
+        .mapPartitions(
+            lambda _part: discover_prefix_shards(
+                config.input_uri,
+                input_format=config.input_format,
+                endpoint_url=config.endpoint_url,
+                region_name=config.region_name,
+                input_credentials_path=config.input_credentials_path,
+                max_prefix_shards=config.max_prefix_shards,
+            )
         )
-    ).collect()
+        .collect()
+    )
     shards_value = tuple(discovered)
     validate_prefix_shards(shards_value)
-    if not shards_value:
-        raise RuntimeError(
-            "automatic input prefix discovery found no immediate user prefixes"
-        )
     LOGGER.info(
         "Spark automatic input prefix discovery: prefixes=%d",
         len(shards_value),
@@ -721,7 +812,7 @@ def _run_spark_job(
     shards_value = _resolve_prefix_shards(context, config)
     shards = context.parallelize(
         list(shards_value),
-        numSlices=min(len(shards_value), parallelism),
+        numSlices=max(1, min(len(shards_value), parallelism)),
     )
     if source_reader is _read_partition:
         # Shuffle only object references first: one huge S3 user prefix must
@@ -769,47 +860,147 @@ def _run_spark_job(
     from pyspark import StorageLevel
 
     from .bounded import BoundedBuildLimits
-    from .component_plan import merge_summaries
+    from .byte_plan import (
+        ByteChunk,
+        allocate_chunk_count,
+        assign_scope_partitions,
+        index_chunks,
+        make_chunk_id,
+        plan_byte_chunks,
+        target_chunk_bytes,
+    )
 
     # Reuse parse work without pinning capture histories in executor memory.
     parsed.persist(StorageLevel.DISK_ONLY)
     cleanup.append(parsed)
     summary_rdd = (
         parsed.filter(lambda item: item[0] == "ok")
-        .map(_component_summary)
-        .reduceByKey(merge_summaries, shuffle_partitions)
+        .map(_scope_byte_summary)
+        .reduceByKey(_merge_byte_summaries, shuffle_partitions)
         .persist(StorageLevel.DISK_ONLY)
     )
     cleanup.append(summary_rdd)
     reporter.set_phase("read_parse_plan")
     summary_count, summary_bytes = summary_rdd.map(
-        lambda item: (1, len(item[0][0].encode()) + len(item[0][1].encode()) + 512)
-    ).fold((0, 0), lambda left, right: (left[0] + right[0], left[1] + right[1]))
-    if summary_count > config.max_scope_summaries:
-        raise RuntimeError("scope summary count limit exceeded; no manifest published")
-    if summary_bytes > config.max_scope_summary_bytes:
-        raise RuntimeError("scope summary byte limit exceeded; no manifest published")
+        lambda item: (1, len(dumps([item[0], item[1][2]])) + 512)
+    ).fold((0, 0), _sum_pair)
+    _admit_scope_plan(summary_count, summary_bytes, config)
     # Admission is checked before collection, including long user identities.
     summary_rows = summary_rdd.collect()
+    largest_scope_records = max((item[0].count for _, item in summary_rows), default=0)
+    sessionless_input_bytes = sum(
+        item[1] for scope, item in summary_rows if scope[0] == "user"
+    )
+    target_bytes = {}
+    chunks = []
+    final_summaries = {}
+    weights = {}
+    for scope, (summary, size, first_key) in summary_rows:
+        if scope[0] != "user":
+            final_summaries[scope] = summary
+            weights[scope] = size
+        elif (
+            allocate_chunk_count(
+                size, summary.count, sessionless_input_bytes, shuffle_partitions
+            )
+            == 1
+        ):
+            # Small users need no metadata sort: their minimum request key was
+            # reduced with the constant-size byte summary above.
+            chunks.append(
+                ByteChunk(
+                    scope, first_key, make_chunk_id(scope, first_key), size, summary
+                )
+            )
+        else:
+            target_bytes[scope] = target_chunk_bytes(
+                size, summary.count, sessionless_input_bytes, shuffle_partitions
+            )
+    byte_plan_started = time.monotonic()
+    if target_bytes:
+        reporter.set_phase("byte_chunk_plan")
+        targets = context.broadcast(target_bytes)
+        cleanup.append(targets)
+        chunk_rdd = (
+            parsed.filter(
+                lambda item: (
+                    item[0] == "ok" and (item[1][2], item[1][3]) in targets.value
+                )
+            )
+            .map(_byte_metadata)
+            .repartitionAndSortWithinPartitions(
+                numPartitions=shuffle_partitions, partitionFunc=_metadata_partition
+            )
+            .mapPartitions(
+                lambda part: plan_byte_chunks(
+                    (value for _key, value in part), targets.value
+                )
+            )
+            .persist(StorageLevel.DISK_ONLY)
+        )
+        cleanup.append(chunk_rdd)
+        chunk_count, chunk_bytes = chunk_rdd.map(
+            lambda chunk: (1, _chunk_plan_size(chunk))
+        ).fold((0, 0), _sum_pair)
+        # Include base summaries and already planned single-chunk users in the
+        # same admission budget. No per-request metadata reaches the Driver.
+        _admit_scope_plan(
+            len(final_summaries) + len(chunks) + chunk_count,
+            summary_bytes
+            + sum(_chunk_plan_size(chunk) for chunk in chunks)
+            + chunk_bytes,
+            config,
+        )
+        chunks.extend(chunk_rdd.collect())
+    by_user = defaultdict(list)
+    for chunk in chunks:
+        by_user[chunk.scope].append(chunk)
+        scope = aggregation_scope("", chunk.scope[1], "", chunk.chunk_id)
+        final_summaries[scope] = chunk.summary
+        weights[scope] = chunk.total_bytes
+    _admit_scope_plan(
+        len(final_summaries),
+        summary_bytes + sum(_chunk_plan_size(chunk) for chunk in chunks),
+        config,
+    )
+    largest_chunk_records = max((chunk.summary.count for chunk in chunks), default=0)
+    largest_chunk_bytes = max((chunk.total_bytes for chunk in chunks), default=0)
+    sessionless_chunks = len(chunks)
+    byte_plan_seconds = time.monotonic() - byte_plan_started
     planning_seconds = time.monotonic() - started
-    largest_scope_records = max((item.count for _, item in summary_rows), default=0)
     splittable_scopes = sum(
-        not item.unsafe and bool(item.min_length) for _, item in summary_rows
+        not item.unsafe and bool(item.min_length) for item in final_summaries.values()
     )
-    summaries = context.broadcast(dict(summary_rows))
-    cleanup.append(summaries)
+    summaries = context.broadcast(final_summaries)
+    chunk_indexes = context.broadcast(
+        {scope: index_chunks(items) for scope, items in by_user.items()}
+    )
+    assignments = context.broadcast(
+        assign_scope_partitions(weights, shuffle_partitions)
+    )
+    cleanup.extend([summaries, chunk_indexes, assignments])
     LOGGER.info(
-        "Spark component plan: scopes=%d splittable=%d summary_bytes=%d",
+        "Spark byte/component plan: input_scopes=%d build_scopes=%d splittable=%d "
+        "sessionless_bytes=%d sessionless_chunks=%d largest_chunk_records=%d "
+        "largest_chunk_bytes=%d partitions=%d byte_plan_seconds=%.1f",
         len(summary_rows),
+        len(final_summaries),
         splittable_scopes,
-        summary_bytes,
+        sessionless_input_bytes,
+        sessionless_chunks,
+        largest_chunk_records,
+        largest_chunk_bytes,
+        shuffle_partitions,
+        byte_plan_seconds,
     )
-    del summary_rows
+    del summary_rows, chunks, by_user, final_summaries, weights, target_bytes
     rows = parsed.map(
-        lambda item: _component_sort_key(item, summaries.value)
+        lambda item: _planned_component_sort_key(
+            item, chunk_indexes.value, summaries.value
+        )
     ).repartitionAndSortWithinPartitions(
         numPartitions=shuffle_partitions,
-        partitionFunc=_scope_partition,
+        partitionFunc=lambda key: _planned_partition(key, assignments.value),
     )
     built = rows.mapPartitions(
         lambda part: _build_sorted_partition(
@@ -888,10 +1079,6 @@ def _run_spark_job(
         _merge_counts(accumulator, [item])
         # One small result per partition, never a list of its output descriptors.
         results.append(item)
-    if not accumulator.stats.input_files:
-        raise RuntimeError(
-            "no input objects matched prefix_shards; no manifest published"
-        )
     error_count = accumulator.stats.skipped_inputs
     if error_count:
         accumulator.stats.skip_reason_counts["parse_failure"] = error_count
@@ -982,6 +1169,12 @@ def _run_spark_job(
         "performance": {
             "total_seconds": round(time.monotonic() - started, 3),
             "read_parse_plan_seconds": round(planning_seconds, 3),
+            "byte_plan_seconds": round(byte_plan_seconds, 3),
+            "sessionless_partitioning": "normalized-bytes-v1",
+            "sessionless_input_bytes": sessionless_input_bytes,
+            "sessionless_chunks": sessionless_chunks,
+            "largest_chunk_records": largest_chunk_records,
+            "largest_chunk_bytes": largest_chunk_bytes,
             "largest_scope_records": largest_scope_records,
             "splittable_scopes": splittable_scopes,
             "disk_scopes": sum(
@@ -1012,6 +1205,7 @@ def run_spark_job(
     client_factory: Callable[..., Any] = create_s3_client,
 ) -> dict[str, Any]:
     """Publish v4 output with task/Driver inventories streamed through local disk."""
+    started_at_ms = unix_ms()
     with tempfile.TemporaryDirectory(prefix="trajfoundry-driver-") as work:
         path = Path(work)
         with DiskManifestAccumulator(
@@ -1019,6 +1213,7 @@ def run_spark_job(
             input_root=config.input_uri,
             input_format=config.input_format,
             config_hash=_config_hash(config),
+            started_at_ms=started_at_ms,
         ) as accumulator:
             cleanup = []
             try:

@@ -9,8 +9,8 @@ SQLite scratch must live on Executor-local storage, never a shared checkpoint.
 
 from __future__ import annotations
 
-import json
 import heapq
+import json
 import logging
 import pickle
 import shutil
@@ -28,7 +28,7 @@ from typing import Any
 import zstandard
 
 from ..canonical import trajectory_id
-from ..identity import normalize_session_id
+from ..identity import aggregation_scope, normalize_session_id
 from ..models import (
     AuditIssue,
     MediaMapping,
@@ -318,6 +318,7 @@ def _trajectory_from_leaf(
             model=leaf.model,
             user_id=leaf.user_id or "no_user_id",
             session_id=session_id or "no_session_id",
+            sessionless_chunk_id=leaf.sessionless_chunk_id if not session_id else "",
             source_type=source_type,
             specific_source=specific_source,
         ),
@@ -350,7 +351,8 @@ class _DiskScope:
                     raw_bytes INTEGER NOT NULL, metadata BLOB NOT NULL,
                     metadata_bytes INTEGER NOT NULL, eligible INTEGER NOT NULL,
                     evidence BLOB, evidence_bytes INTEGER NOT NULL,
-                    has_routing INTEGER NOT NULL, endpoint INTEGER, prefix_end INTEGER
+                    has_routing INTEGER NOT NULL, endpoint INTEGER, prefix_end INTEGER,
+                    aggregation_scope TEXT NOT NULL
                 );
                 CREATE TABLE scopes(scope_key BLOB PRIMARY KEY, root INTEGER NOT NULL);
                 CREATE TABLE nodes(
@@ -457,7 +459,7 @@ class _DiskScope:
             # Match build_scope's dict comprehension: duplicate source paths
             # are last-writer-wins BEFORE prefix coverage is computed.
             self.db.execute(
-                "INSERT OR REPLACE INTO captures VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO captures VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     item.source_path,
                     item.source_sha256,
@@ -476,12 +478,32 @@ class _DiskScope:
                     int(has_routing),
                     None,
                     None,
+                    json.dumps(
+                        aggregation_scope(
+                            item.session_id,
+                            item.user_id,
+                            item.captured_at,
+                            item.sessionless_chunk_id,
+                        )
+                    ),
                 ),
             )
             if count % 1000 == 0:
                 self.db.commit()
             progress.tick(count)
         self.db.commit()
+        if (
+            len(
+                self.db.execute(
+                    "SELECT DISTINCT aggregation_scope FROM captures LIMIT 2"
+                ).fetchall()
+            )
+            > 1
+        ):
+            raise ValueError(
+                "bounded builder requires one aggregation scope; "
+                "group captures by session or user/chunk before building"
+            )
         self.db.execute(f"CREATE INDEX captures_stable ON captures({_STABLE})")
         self.db.execute(
             "CREATE INDEX captures_thread ON captures(thread_id,session_id)"
@@ -1230,6 +1252,8 @@ def build_scope_bounded(
 ) -> Iterator[BuiltTrajectory]:
     """Consume a scope once, spill exact state, then yield deduplicated roots.
 
+    Input must belong to one session or missing-session user/chunk scope;
+    mixed scopes fail before prefix aggregation or subagent planning.
     Close the iterator when stopping early so its private scratch directory is
     released. Any admission, disk, materialization or quality error propagates;
     callers must not publish a successful manifest after such an error.

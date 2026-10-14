@@ -13,6 +13,7 @@ MAX_JOBS = 64
 PHASES = {
     "starting",
     "read_parse_plan",
+    "byte_chunk_plan",
     "build_publish",
     "merge_inventory",
     "merge_sidecars",

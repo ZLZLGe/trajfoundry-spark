@@ -110,6 +110,15 @@ the existing flat-v4 JSONL output. It does not persist Snapshot Parquet or a
 long-lived `spark-work` tree, but Spark may use executor-local disk for
 shuffle/spill. The original Python entry points remain available for other
 formats and as a rollback path.
+For Spark only, missing-session users are divided into approximately equal-byte
+chunks, weighted by the uncompressed, normalized Snapshot JSON. Requests are
+ordered by capture time and stable source identity; time is an ordering key,
+not a fixed-hour aggregation boundary. `shuffle_partitions` determines the
+proportional chunk target, not a hard limit on the number of chunks. A request
+is never split, and oversized requests occupy their own chunks. Prefix matching
+and subagent mounting do not cross chunk boundaries. Chunk weights also balance
+the physical Spark tasks. Real sessions and the ordinary Python deployment keep
+their existing grouping semantics.
 
 For the ordinary Python CLI below, the input tree is read-only and a non-empty
 output directory requires `--resume` (the independent Spark path instead
@@ -128,6 +137,9 @@ deterministic for the same inputs and configuration; only the manifest creation
 timestamp changes.
 
 ## Normalization rules
+
+Batch feedback fields, node-local token estimates, and the Python/Spark grouping
+boundaries are described in [production feedback](docs/production-feedback.md).
 
 - Supported endpoints: OpenAI-compatible Responses and Anthropic Messages,
   plus OpenAI-compatible Chat Completions. Streamed and non-streamed responses

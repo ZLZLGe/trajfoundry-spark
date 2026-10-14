@@ -112,7 +112,8 @@ def test_session_sentinel_uses_exact_user_shuffle_scope(session_id, user_id) -> 
         json.dumps(envelope).encode(),
         input_format="tokenplan",
     )
-    assert (row.scope_kind, row.scope_id) == ("user", user_id)
+    assert row.scope_kind == "user"
+    assert row.scope_id == user_id
     assert row.session_id == ""
     assert json.loads(row.snapshot_json)["session_id"] == ""
     assert row.user_id == user_id

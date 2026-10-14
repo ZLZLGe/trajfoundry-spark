@@ -9,7 +9,7 @@ from hashlib import sha256
 from typing import Any
 
 from .canonical import compaction_signature
-from .identity import normalize_session_id
+from .identity import aggregation_scope, normalize_session_id
 from .models import Message, Snapshot
 from .tool_names import is_spawn_tool_name
 
@@ -55,7 +55,7 @@ def _compatibility(snapshot: Snapshot) -> tuple[Hashable, bytes]:
     """Return the scope in which a capture may be a cumulative prefix.
 
     A real session is deliberately paired with its thread.  Captures whose
-    session is absent are allowed to merge by user, but never across users;
+    session is absent are allowed to merge by user and planner-assigned chunk;
     using a distinct scope tag also prevents a user id from colliding with a
     session id. Both an empty session and the literal ``no_session_id`` input
     sentinel mean missing; redacted sessions remain isolated by source.
@@ -77,7 +77,12 @@ def _compatibility(snapshot: Snapshot) -> tuple[Hashable, bytes]:
         # the user's missing-session bucket.
         scope = ("masked-session-source", snapshot.source_path)
     else:
-        scope = ("user", snapshot.user_id)
+        scope = aggregation_scope(
+            snapshot.session_id,
+            snapshot.user_id,
+            snapshot.captured_at,
+            snapshot.sessionless_chunk_id,
+        )
     return scope, compaction_signature(snapshot.compaction_items)
 
 

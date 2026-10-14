@@ -11,6 +11,7 @@ def test_streamed_manifest_matches_existing_contract(tmp_path):
         "input_root": "s3://fake/input/",
         "input_format": "tokenplan",
         "config_hash": "abc",
+        "started_at_ms": 1000,
     }
     old = ManifestAccumulator(**kwargs)
     with DiskManifestAccumulator(tmp_path / "meta.db", **kwargs) as disk:
@@ -20,12 +21,17 @@ def test_streamed_manifest_matches_existing_contract(tmp_path):
             disk.add_object(description)
         old.stats.input_files = disk.stats.input_files = 42
         old.stats.reason_counts = disk.stats.reason_counts = {"synthetic": 2}
-        disk.write_manifest(tmp_path / "manifest.json", created_at="test")
+        disk.write_manifest(
+            tmp_path / "manifest.json", created_at="test", completed_at_ms=2000
+        )
         assert json.loads((tmp_path / "manifest.json").read_bytes()) == json.loads(
-            old.manifest_bytes(created_at="test")
+            old.manifest_bytes(created_at="test", completed_at_ms=2000)
         )
         assert disk.object_count == 3
         assert not hasattr(disk, "_objects")
+        manifest = json.loads((tmp_path / "manifest.json").read_bytes())
+        assert manifest["sessionless_partitioning"] == "normalized-bytes-v1"
+        assert "sessionless_window_hours" not in manifest
 
 
 @pytest.mark.parametrize("same_path", [True, False])

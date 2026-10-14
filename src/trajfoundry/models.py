@@ -264,6 +264,7 @@ class Metadata(StrictModel):
     model: str = ""
     user_id: str = ""
     session_id: str = ""
+    sessionless_chunk_id: str = ""
     sub_session_id: int = Field(default=0, ge=0)
     source_type: Literal["api-router", "traj-cooperate"] = "api-router"
     specific_source: Literal["free-router", "token-plan", "SXF", "deep-infra"] = (
@@ -302,6 +303,7 @@ class TrajectoryNode(StrictModel):
     source: str
     total_rounds: int = 0
     total_tool_calls: int = 0
+    total_tokens: int = Field(default=0, ge=0)
     tool_counts: dict[str, int] = Field(default_factory=dict)
     reasoning_total_tokens: int = 0
     tool_defs_tag: Literal["complete", "incomplete", "complete_with_incomplete_sub"] = (
@@ -337,6 +339,8 @@ class Snapshot(StrictModel):
     source_sha256: str
     source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
     session_id: str
+    # Assigned by Spark's byte-balanced planner, never inferred from payload.
+    sessionless_chunk_id: str = ""
     thread_id: str
     turn_id: str = ""
     parent_thread_id: str = ""

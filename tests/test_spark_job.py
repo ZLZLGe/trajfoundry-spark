@@ -169,8 +169,12 @@ def test_publish_consumes_trajectories_incrementally_and_sorts_only_lineage(tmp_
     )
     assert results[0]["object_count"] == 2
     assert "objects" not in results[0]
-    assert results[0]["objects_part"]["path"] == "diagnostics/._objects_part_000000.ndjson"
-    assert results[0]["lineage_part"]["path"] == "diagnostics/._lineage_part_000000.ndjson"
+    assert (
+        results[0]["objects_part"]["path"] == "diagnostics/._objects_part_000000.ndjson"
+    )
+    assert (
+        results[0]["lineage_part"]["path"] == "diagnostics/._lineage_part_000000.ndjson"
+    )
     inventory = tmp_path / "fake" / "out" / results[0]["objects_part"]["path"]
     assert len(inventory.read_bytes().splitlines()) == 2
     lines = (
@@ -202,16 +206,18 @@ def test_partition_descriptor_limit_is_fail_closed(tmp_path):
 def test_publish_verifies_remote_trajectory_before_receipt(tmp_path):
     built = job.build_scope([_snapshot()])[0]
     with pytest.raises(ValueError, match="hash or size"):
-        list(job._publish_partition(
-            0,
-            iter([("trajectory", built)]),
-            output_uri="s3://fake/out/",
-            endpoint_url=None,
-            region_name="unused",
-            client_factory=partial(
-                CorruptObjectStore, str(tmp_path), corrupt_kind="trajectory"
-            ),
-        ))
+        list(
+            job._publish_partition(
+                0,
+                iter([("trajectory", built)]),
+                output_uri="s3://fake/out/",
+                endpoint_url=None,
+                region_name="unused",
+                client_factory=partial(
+                    CorruptObjectStore, str(tmp_path), corrupt_kind="trajectory"
+                ),
+            )
+        )
     assert not list((tmp_path / "fake" / "out").rglob("._objects_part*"))
 
 
@@ -224,15 +230,17 @@ def test_publish_forwards_only_output_credential_path(monkeypatch, tmp_path):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(job, "create_output_store", store)
-    list(job._publish_partition(
-        0,
-        iter(()),
-        output_uri="s3://fake/out/",
-        endpoint_url=None,
-        region_name="unused",
-        client_factory=partial(LocalObjectStore, str(tmp_path)),
-        output_credentials_path="/shared/private/output.json",
-    ))
+    list(
+        job._publish_partition(
+            0,
+            iter(()),
+            output_uri="s3://fake/out/",
+            endpoint_url=None,
+            region_name="unused",
+            client_factory=partial(LocalObjectStore, str(tmp_path)),
+            output_credentials_path="/shared/private/output.json",
+        )
+    )
     assert seen == ["/shared/private/output.json"]
 
 
@@ -452,14 +460,18 @@ def test_real_spark_local_two_end_to_end_and_effective_submit_settings(
     assert validate_output(output).valid
     assert result["diagnostics"]["path"] == "diagnostics/input_diagnostics.ndjson"
     assert {path.name for path in output.iterdir()} == {
-        "session-1_sub_0.jsonl", "manifest.json", "lineage.jsonl", "diagnostics"
+        "session-1_sub_0.jsonl",
+        "manifest.json",
+        "lineage.jsonl",
+        "diagnostics",
     }
     diagnostic = json.loads((output / result["diagnostics"]["path"]).read_bytes())
     assert diagnostic["source_ref"] == "bob/req_invalid.json"
     assert not list(output.rglob("._*"))
     before = {
         path.relative_to(output): path.read_bytes()
-        for path in output.rglob("*") if path.is_file()
+        for path in output.rglob("*")
+        if path.is_file()
     }
     with pytest.raises(ValueError, match="not empty"):
         job.run_spark_job(
@@ -470,7 +482,8 @@ def test_real_spark_local_two_end_to_end_and_effective_submit_settings(
         )
     assert {
         path.relative_to(output): path.read_bytes()
-        for path in output.rglob("*") if path.is_file()
+        for path in output.rglob("*")
+        if path.is_file()
     } == before
 
 
@@ -543,18 +556,21 @@ def test_real_spark_recomputed_parse_counts_are_data_not_accumulator_updates(
     assert sum(item.get("skipped_inputs", 0) for item in counts) == 1
 
 
-def test_real_spark_empty_shards_do_not_publish_success(local_spark, tmp_path):
+def test_real_spark_empty_shards_publish_zero_feedback(local_spark, tmp_path):
     config = SparkNormalizeConfig(
         "s3://fake/in/", "s3://fake/out/", prefix_shards=("wrong/",)
     )
-    with pytest.raises(RuntimeError, match="no input objects"):
-        job.run_spark_job(
-            config,
-            spark=local_spark,
-            source_reader=partial(synthetic_reader, records=[]),
-            client_factory=partial(LocalObjectStore, str(tmp_path)),
-        )
-    assert not (tmp_path / "fake" / "out" / "manifest.json").exists()
+    result = job.run_spark_job(
+        config,
+        spark=local_spark,
+        source_reader=partial(synthetic_reader, records=[]),
+        client_factory=partial(LocalObjectStore, str(tmp_path)),
+    )
+    manifest = json.loads((tmp_path / "fake" / "out" / "manifest.json").read_bytes())
+    assert result["trajectories"] == 0
+    assert manifest["status"] == "SUCCEEDED"
+    assert manifest["record_count"] == manifest["total_bytes"] == 0
+    assert manifest["parse_failure_count"] == 0
 
 
 def test_real_spark_user_scopes_and_final_identity_deduplication(local_spark, tmp_path):

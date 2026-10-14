@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 from ..canonical import trajectory_id
 from ..export import SCHEMA_VERSION, ExportStats, trajectory_filename
+from ..feedback import feedback_fields, is_trajectory_data_file, unix_ms
 from ..json_codec import dumps
 from ..models import QuarantineRecord, TrajectoryNode
 from ..output_contract import project_trajectory
@@ -351,6 +352,7 @@ class ManifestAccumulator:
     input_format: InputFormat
     config_hash: str
     stats: ExportStats = field(default_factory=ExportStats)
+    started_at_ms: int = field(default_factory=unix_ms)
     _objects: dict[str, SparkObjectDescription] = field(
         default_factory=dict, init=False
     )
@@ -408,12 +410,31 @@ class ManifestAccumulator:
     def lineage_records(self) -> int:
         return self._lineage_records
 
-    def manifest_bytes(self, *, created_at: str | None = None) -> bytes:
+    def manifest_bytes(
+        self,
+        *,
+        created_at: str | None = None,
+        completed_at_ms: int | None = None,
+    ) -> bytes:
         """Return a v4 manifest; callers publish it only after validation."""
 
         created = created_at or datetime.now(UTC).isoformat()
         manifest = {
+            **feedback_fields(
+                self.stats,
+                total_bytes=sum(
+                    item.bytes
+                    for item in self.objects
+                    if is_trajectory_data_file(item.path)
+                ),
+                started_at_ms=self.started_at_ms,
+                completed_at_ms=completed_at_ms,
+                parse_failure_count=self.stats.skip_reason_counts.get(
+                    "parse_failure", 0
+                ),
+            ),
             "schema_version": SCHEMA_VERSION,
+            "sessionless_partitioning": "normalized-bytes-v1",
             "created_at": created,
             "input_root": self.input_root,
             "input_format": self.input_format,

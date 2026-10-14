@@ -14,6 +14,8 @@ from typing import Any, Literal, Self
 import orjson
 
 from .canonical import trajectory_id
+from .feedback import feedback_fields, unix_ms
+from .identity import normalize_session_id
 from .io import file_sha256
 from .json_codec import dumps, loads
 from .models import QuarantineRecord, TrajectoryNode
@@ -50,7 +52,7 @@ class ExportStats:
 
 
 def _session_was_synthesized(node: TrajectoryNode) -> bool:
-    if not node.metadata.session_id:
+    if not node.metadata.session_id or node.metadata.sessionless_chunk_id:
         return True
     audit = node.normalization_audit
     return bool(
@@ -178,6 +180,7 @@ class OutputSet:
         if max_shard_bytes <= 0:
             raise ValueError("max shard bytes must be positive")
         self.max_shard_bytes = max_shard_bytes
+        self._started_at_ms = unix_ms()
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         # Remove leftovers from an interrupted/failed publication before any
@@ -202,6 +205,8 @@ class OutputSet:
         self._lineage_tmp = self._stage / "lineage.jsonl.tmp"
         self._lineage = self._lineage_tmp.open("wb")
         self.stats = ExportStats()
+        self._has_chunked_sessionless = False
+        self._has_unchunked_sessionless = False
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -216,6 +221,19 @@ class OutputSet:
     ) -> str:
         projected = project_trajectory(node)
         validate_derived_fields(node)
+        pending_nodes = [node]
+        chunked = self._has_chunked_sessionless
+        unchunked = self._has_unchunked_sessionless
+        while pending_nodes:
+            current = pending_nodes.pop()
+            if not normalize_session_id(current.metadata.session_id):
+                chunked |= bool(current.metadata.sessionless_chunk_id)
+                unchunked |= not current.metadata.sessionless_chunk_id
+            pending_nodes.extend((current.sub_agent_trajectory or {}).values())
+        if chunked and unchunked:
+            raise ValueError("cannot mix chunked and unchunked sessionless identities")
+        self._has_chunked_sessionless = chunked
+        self._has_unchunked_sessionless = unchunked
         identifier = trajectory_id(node)
         filename = trajectory_filename(node, identifier)
         if filename in self._trajectory_names:
@@ -275,6 +293,8 @@ class OutputSet:
         *,
         input_root: str,
         config_hash: str,
+        started_at_ms: int | None = None,
+        parse_failure_count: int = 0,
         input_format: Literal[
             "freerouter", "tokenplan", "sxf", "deepinfra"
         ] = "freerouter",
@@ -313,6 +333,22 @@ class OutputSet:
                 for path in files
             ],
         }
+        if self._has_chunked_sessionless:
+            manifest["sessionless_partitioning"] = "normalized-bytes-v1"
+        manifest.update(
+            feedback_fields(
+                self.stats,
+                total_bytes=sum(
+                    item["bytes"]
+                    for item in manifest["files"]
+                    if item["path"] != "lineage.jsonl"
+                ),
+                started_at_ms=self._started_at_ms
+                if started_at_ms is None
+                else started_at_ms,
+                parse_failure_count=parse_failure_count,
+            )
+        )
         manifest_bytes = dumps(manifest, sort_keys=True, indent=2)
         with self._manifest_tmp.open("wb") as handle:
             handle.write(manifest_bytes)

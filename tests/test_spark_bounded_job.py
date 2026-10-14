@@ -1,17 +1,19 @@
 import json
 from functools import partial, reduce
 
+from trajfoundry.identity import aggregation_scope
 from trajfoundry.models import Snapshot
 from trajfoundry.pipeline import _snapshot_record
 from trajfoundry.spark.adapters import parse_payload
 from trajfoundry.spark.build import build_scope
+from trajfoundry.spark.byte_plan import make_chunk_id, record_order_key
 from trajfoundry.spark.component_plan import (
     component_key,
     merge_summaries,
     summarize_snapshot,
 )
 from trajfoundry.spark.config import SparkNormalizeConfig
-from trajfoundry.spark.job import _scope_partition, run_spark_job
+from trajfoundry.spark.job import run_spark_job
 from trajfoundry.spark.output import ManifestAccumulator
 from trajfoundry.validation import validate_output
 
@@ -92,44 +94,34 @@ def test_same_missing_user_components_mix_disk_and_memory_with_unsplit_parity(
     disk_key = component_key(disk_snapshots[0], summary)
     assert {component_key(item, summary) for item in disk_snapshots} == {disk_key}
 
-    # Find a second component in the opposite *worker* hash partition so this
-    # also exercises lineage merging across two real local Spark tasks, without
-    # relying on a hard-coded or Driver-specific PYTHONHASHSEED.
-    candidates = [
-        _sessionless_record(
-            "shared-user/req_memory.json",
-            f"independent conversation {index}",
-            depth=0,
-            thread="memory-thread",
-            order=5,
-        )
-        for index in range(32)
-    ]
-    candidate_keys = [
-        component_key(_parsed_snapshot(record), summary) for record in candidates
-    ]
-    partitions = dict(
-        local_spark.sparkContext.parallelize(
-            [(-1, disk_key), *enumerate(candidate_keys)], 2
-        )
-        .map(
-            lambda item: (
-                item[0],
-                _scope_partition(("user", "shared-user", item[1])) % 2,
-            )
-        )
-        .collect()
+    # One byte chunk can retain separate safe prefix components. Its large
+    # component uses the disk builder and the independent short one stays in
+    # memory, without relying on Driver/worker-dependent Python hash placement.
+    memory_record = _sessionless_record(
+        "shared-user/req_memory.json",
+        "independent conversation",
+        depth=0,
+        thread="memory-thread",
+        order=5,
     )
-    selected = next(
-        index for index in range(len(candidates)) if partitions[index] != partitions[-1]
-    )
-    records = [*disk_records, candidates[selected]]
+    assert component_key(_parsed_snapshot(memory_record), summary) != disk_key
+    capture = disk_snapshots[0]
+    scope = aggregation_scope(capture.session_id, capture.user_id, capture.captured_at)
+    records = [*disk_records, memory_record]
     snapshots = list(map(_parsed_snapshot, records))
     assert {item.user_id for item in snapshots} == {"shared-user"}
     assert {item.session_id for item in snapshots} == {""}
 
-    # The reference deliberately bypasses component planning and the disk
-    # builder: one original user scope goes through the old in-memory builder.
+    # With one shuffle partition the user is assigned one byte chunk. Give
+    # the independent unsplit reference the same deterministic identity while
+    # bypassing both component planning and the disk builder.
+    first_key = min(
+        record_order_key(item.captured_at, item.source_path, item.source_sha256)
+        for item in snapshots
+    )
+    chunk_id = make_chunk_id(scope, first_key)
+    for item in snapshots:
+        item.sessionless_chunk_id = chunk_id
     baseline = ManifestAccumulator("s3://fake/input/", "tokenplan", "test-baseline")
     baseline.stats.input_files = len(records)
     for item in snapshots:
@@ -153,7 +145,7 @@ def test_same_missing_user_components_mix_disk_and_memory_with_unsplit_parity(
             str(output),
             prefix_shards=("shared-user/",),
             default_parallelism=2,
-            shuffle_partitions=2,
+            shuffle_partitions=1,
             max_scope_snapshots=4,
         ),
         spark=local_spark,

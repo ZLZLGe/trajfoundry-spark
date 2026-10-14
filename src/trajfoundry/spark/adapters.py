@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from ..identity import normalize_session_id
+from ..identity import aggregation_scope, normalize_session_id
 from ..io import decode_capture
 from ..json_codec import dumps as json_dumps
 from ..pipeline import parse_capture
@@ -19,13 +19,13 @@ InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
 
 
 def _scope_fields(snapshot: Any) -> tuple[str, str]:
-    session_id = normalize_session_id(snapshot.session_id)
-    user_id = snapshot.user_id or ""
-    if session_id:
-        return "session", session_id
-    # Keep missing users distinct from a literal user named "no_user_id".
-    # Public placeholders belong in final output, not in shuffle identities.
-    return "user", user_id
+    # Parsing establishes only the base session/user identity. The Spark job
+    # assigns byte chunks after collecting lightweight size/order summaries.
+    # Capture time orders requests; it no longer establishes hour boundaries.
+    # Raw user ids keep missing users distinct from a literal "no_user_id".
+    return aggregation_scope(
+        snapshot.session_id, snapshot.user_id, snapshot.captured_at
+    )
 
 
 def parse_payload(

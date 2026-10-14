@@ -94,6 +94,9 @@ def test_real_spark_local_output_end_to_end_is_s3_free(local_spark, tmp_path, ur
         "s3://fake/in/",
         _output_uri(output, uri_kind),
         prefix_shards=("alice/", "bob/"),
+        # This storage test checks prefix merging within one logical user chunk.
+        # Multi-chunk boundary behavior has separate byte-planning coverage.
+        shuffle_partitions=1,
     )
     result = job.run_spark_job(
         config,
@@ -105,7 +108,7 @@ def test_real_spark_local_output_end_to_end_is_s3_free(local_spark, tmp_path, ur
     assert result["input_files"] == 4
     assert result["parse_failures"] == 1
     assert result["trajectories"] == 2
-    assert result["shuffle_partitions"] == 2
+    assert result["shuffle_partitions"] == 1
     report = validate_output(output)
     assert report.valid, report.errors
 
@@ -205,19 +208,21 @@ def test_real_spark_local_descriptor_limit_never_publishes_manifest(
     assert not (output / "manifest.json").exists()
 
 
-def test_real_spark_empty_local_input_never_publishes_manifest(local_spark, tmp_path):
+def test_real_spark_empty_local_input_publishes_zero_feedback(local_spark, tmp_path):
     output = tmp_path / "no-input-output"
     config = SparkNormalizeConfig(
         "s3://fake/in/", str(output), prefix_shards=("unmatched/",)
     )
-    with pytest.raises(RuntimeError, match="no input objects"):
-        job.run_spark_job(
-            config,
-            spark=local_spark,
-            source_reader=partial(synthetic_reader, records=[]),
-            client_factory=_forbidden_s3_client,
-        )
-    assert not (output / "manifest.json").exists()
+    job.run_spark_job(
+        config,
+        spark=local_spark,
+        source_reader=partial(synthetic_reader, records=[]),
+        client_factory=_forbidden_s3_client,
+    )
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    assert manifest["status"] == "SUCCEEDED"
+    assert manifest["record_count"] == manifest["total_bytes"] == 0
+    assert validate_output(output).valid
 
 
 def test_real_spark_local_part_cleanup_failure_never_publishes_manifest(

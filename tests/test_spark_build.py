@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from trajfoundry.identity import aggregation_scope
 from trajfoundry.models import (
     AuditIssue,
     AuditTag,
@@ -269,8 +270,8 @@ def test_sessionless_prefixes_merge_by_user_and_outputs_remain_distinct() -> Non
             Snapshot.model_validate_json(row.snapshot_json)
         )
     assert set(grouped) == {
-        ("user", "alice"),
-        ("user", "bob"),
+        aggregation_scope("", "alice", rows[0].captured_at),
+        aggregation_scope("", "bob", rows[0].captured_at),
         ("session", "real-session"),
     }
     artifacts = []
@@ -289,7 +290,7 @@ def test_sessionless_prefixes_merge_by_user_and_outputs_remain_distinct() -> Non
                 artifact.filename
                 == f"no_session_id_{artifact.trajectory_id}_sub_0.jsonl"
             )
-        if key == ("user", "alice"):
+        if key == aggregation_scope("", "alice", rows[0].captured_at):
             assert {origin["source_ref"] for origin in built[0].origins} == {
                 "alice-short.json",
                 "alice-long.json",
