@@ -739,6 +739,10 @@ class _DiskScope:
 
         def flush_covered() -> None:
             if pending_covered:
+                # Coverage and node batches fill independently. An UPDATE
+                # against an uninserted node is silently lost by SQLite, so
+                # insert every pending node before marking covered prefixes.
+                flush_nodes()
                 self.db.executemany(
                     "UPDATE nodes SET covered=1 WHERE id=?", pending_covered
                 )

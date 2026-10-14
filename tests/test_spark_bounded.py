@@ -24,6 +24,7 @@ from trajfoundry.spark.bounded import (
 )
 from trajfoundry.spark.build import build_scope
 from trajfoundry.spark.output import serialize_trajectory
+from trajfoundry.streaming import streaming_prefix_leaves
 from trajfoundry.subagents import (
     MountDiagnostic,
     MountEdge,
@@ -409,6 +410,119 @@ def test_cumulative_prefixes_branches_replays_and_flat_issue_union(tmp_path, see
     expected = build_scope(captures)
     assert actual == expected
     assert _artifacts(actual) == _artifacts(expected)
+
+
+def _prefix_batch_capture(name, tokens, history_length):
+    messages = [user(token) for token in tokens]
+    capture = snapshot(
+        name,
+        thread="main",
+        turn=name,
+        history=messages[:history_length],
+        response=messages[history_length:],
+    )
+    capture.session_id = ""
+    capture.user_id = "batch-test-user"
+    return capture
+
+
+def _prefix_batch_boundary_captures(batch):
+    # A's transcript and the scope root fill the INSERT batch exactly. B's
+    # nodes stay pending; C closes B's stack and fills the independent covered
+    # batch while only three new nodes await insertion.
+    return [
+        _prefix_batch_capture("A", ["a", *(["x"] * (batch - 2))], batch - 2),
+        _prefix_batch_capture("B-short", ["b"], 0),
+        _prefix_batch_capture("B-long", ["b", "z"], 1),
+        _prefix_batch_capture("C", ["c"], 0),
+    ]
+
+
+def _assert_disk_prefix_index_matches_memory(captures, database):
+    expected = streaming_prefix_leaves(captures)
+    scope = bounded._DiskScope(database, BoundedBuildLimits())
+    try:
+        scope.ingest(captures)
+        scope.index()
+        actual_paths = {
+            path
+            for (path,) in scope.db.execute(
+                "SELECT source_path FROM captures JOIN nodes ON endpoint=nodes.id "
+                "WHERE covered=0"
+            )
+        }
+        assert actual_paths == {leaf.source_path for leaf in expected.leaves}
+        for leaf in expected.leaves:
+            assert (
+                tuple(path for (path,) in scope.paths(source_path=leaf.source_path))
+                == expected.contributor_paths[leaf.source_path]
+            )
+    finally:
+        scope.close()
+    return expected
+
+
+def test_prefix_covered_batch_inserts_pending_nodes_at_default_threshold(tmp_path):
+    # Do not lower the production 20,000-node threshold for this regression.
+    captures = _prefix_batch_boundary_captures(bounded._PREFIX_INSERT_BATCH)
+    expected = _assert_disk_prefix_index_matches_memory(
+        captures, tmp_path / "prefix-default-batch.sqlite"
+    )
+    assert {leaf.source_path for leaf in expected.leaves} == {
+        "/A.json",
+        "/B-long.json",
+        "/C.json",
+    }
+    assert expected.contributor_paths["/B-long.json"] == (
+        "/B-long.json",
+        "/B-short.json",
+    )
+
+
+def test_prefix_covered_batches_preserve_realistic_length_chains(tmp_path):
+    # Ordinary 121-127-message histories also cross the default SQL batches;
+    # the failure does not require one giant 20,000-message request.
+    captures = [
+        _prefix_batch_capture(
+            f"group-{group:04d}-length-{length}",
+            [f"g{group:04d}", *(["x"] * (length - 1))],
+            length - 1,
+        )
+        for group in range(400)
+        for length in (121, 123, 125, 127)
+    ]
+    expected = _assert_disk_prefix_index_matches_memory(
+        captures, tmp_path / "prefix-realistic-batches.sqlite"
+    )
+    assert len(expected.leaves) == 400
+    assert all(len(paths) == 4 for paths in expected.contributor_paths.values())
+    assert {
+        path for paths in expected.contributor_paths.values() for path in paths
+    } == {capture.source_path for capture in captures}
+
+
+@pytest.mark.parametrize("reverse_input", [False, True])
+@pytest.mark.parametrize("external_sort", [False, True])
+def test_prefix_covered_batch_preserves_outputs_and_origins(
+    monkeypatch, tmp_path, reverse_input, external_sort
+):
+    monkeypatch.setattr(bounded, "_PREFIX_INSERT_BATCH", 4)
+    if external_sort:
+        monkeypatch.setattr(bounded, "_PREFIX_RUN_BYTES", 1)
+        monkeypatch.setattr(bounded, "_PREFIX_MERGE_FANIN", 2)
+    captures = _prefix_batch_boundary_captures(4)
+    if reverse_input:
+        captures.reverse()
+    expected = build_scope(captures)
+    actual = tuple(build_scope_bounded(captures, workspace_parent=tmp_path))
+    assert len(expected) == 3
+    assert actual == expected
+    assert _artifacts(actual) == _artifacts(expected)
+    assert {origin["source_ref"] for item in actual for origin in item.origins} == {
+        capture.source_path for capture in captures
+    }
+    assert sum(len(item.origins) for item in actual) == 4
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_duplicate_source_is_last_writer_wins_before_prefix_index(tmp_path):
