@@ -102,6 +102,24 @@ def test_parse_payload_preserves_user_scope_when_session_is_missing() -> None:
     assert row.user_id == "user-7"
 
 
+def test_parse_payload_preserves_end_user_without_changing_source_user_scope() -> None:
+    envelope = _tokenplan_envelope(session_id="")
+    envelope["metadata"]["source_user_id"] = "source-user"
+    envelope["metadata"]["end_user_id"] = "end-user"
+
+    row = parse_payload(
+        "req.json",
+        json.dumps(envelope).encode(),
+        input_format="tokenplan",
+    )
+
+    snapshot = json.loads(row.snapshot_json)
+    assert (row.scope_kind, row.scope_id) == ("user", "source-user")
+    assert row.user_id == "source-user"
+    assert snapshot["user_id"] == "source-user"
+    assert snapshot["end_user_id"] == "end-user"
+
+
 @pytest.mark.parametrize("session_id", ["", "no_session_id"])
 @pytest.mark.parametrize("user_id", ["alice", "bob", "", "no_user_id"])
 def test_session_sentinel_uses_exact_user_shuffle_scope(session_id, user_id) -> None:

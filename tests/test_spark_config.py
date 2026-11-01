@@ -22,6 +22,17 @@ def test_defaults_preserve_submit_resources_and_client_mode() -> None:
 
     assert settings == {}
     assert config.total_executor_cores is None
+    assert config.max_output_objects is None
+    assert config.max_partition_objects == 20_000_000
+    assert config.max_input_object_bytes == 2 * 1024**3
+    assert config.scope_memory_bytes == 256 * 1024**2
+    assert config.max_scope_snapshots == 10_000
+    assert config.max_scope_summaries == 1_000_000
+    assert config.max_scope_summary_bytes == 512 * 1024**2
+    assert config.max_routing_bytes == 4 * 1024**3
+    assert config.max_routing_snapshots == 2_000_000
+    assert config.max_root_bytes == 2 * 1024**3
+    assert config.max_prefix_shards == 1_000_000
 
 
 def test_only_explicit_resource_overrides_are_emitted() -> None:
@@ -92,3 +103,7 @@ def test_credentials_path_is_not_a_spark_configuration_value() -> None:
     assert config.input_credentials_path == "/shared/private/credentials.json"
     assert config.output_credentials_path == "/shared/private/output.json"
     assert config.spark_conf() == {}
+
+
+def test_config_accepts_unlimited_total_output_objects() -> None:
+    assert _config(max_output_objects=None).max_output_objects is None

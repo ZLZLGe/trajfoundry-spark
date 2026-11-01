@@ -80,12 +80,12 @@ class BoundedBuildLimitError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class BoundedBuildLimits:
-    sqlite_cache_mib: int = 32
-    lookup_cache_bytes: int = 32 * _MIB
-    max_snapshot_bytes: int = 32 * _MIB
-    max_root_bytes: int = 64 * _MIB
-    max_routing_bytes: int = 32 * _MIB
-    max_routing_snapshots: int = 10_000
+    sqlite_cache_mib: int = 256
+    lookup_cache_bytes: int = 256 * _MIB
+    max_snapshot_bytes: int = 2 * 1024 * _MIB
+    max_root_bytes: int = 2 * 1024 * _MIB
+    max_routing_bytes: int = 4 * 1024 * _MIB
+    max_routing_snapshots: int = 2_000_000
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -317,6 +317,7 @@ def _trajectory_from_leaf(
             created_at=leaf.captured_at,
             model=leaf.model,
             user_id=leaf.user_id or "no_user_id",
+            end_user_id=leaf.end_user_id,
             session_id=session_id or "no_session_id",
             sessionless_chunk_id=leaf.sessionless_chunk_id if not session_id else "",
             source_type=source_type,

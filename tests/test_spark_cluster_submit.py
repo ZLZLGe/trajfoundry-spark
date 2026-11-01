@@ -131,6 +131,7 @@ def test_resource_profiles_have_exact_64_gib_envelope(
     assert conf["spark.executor.cores"] == "8"
     assert conf["spark.executor.memory"] == "16g"
     assert conf["spark.executor.memoryOverhead"] == "48g"
+    assert conf["spark.driver.maxResultSize"] == "1g"
     assert "spark.executor.pyspark.memory" not in conf
     assert "spark.kubernetes.submitInDriver" not in conf
     assert conf["spark.memory.offHeap.enabled"] == "false"
@@ -145,11 +146,55 @@ def test_resource_profiles_have_exact_64_gib_envelope(
     properties = Path(plan["command"][plan["command"].index("--properties-file") + 1])
     assert properties.is_file() and properties.name == "cluster-isolated.properties"
     for flag, value in (
-        ("--max-routing-mib", "2048"),
-        ("--max-routing-snapshots", "1000000"),
-        ("--max-root-mib", "64"),
+        ("--max-routing-mib", "4096"),
+        ("--max-routing-snapshots", "2000000"),
+        ("--max-root-mib", "2048"),
     ):
         assert plan["command"][plan["command"].index(flag) + 1] == value
+
+
+def test_event_log_configuration_is_forwarded(invocation):
+    _, plan = parsed_plan(invocation)
+    conf = conf_of(plan)
+    assert conf["spark.eventLog.enabled"] == "true"
+    assert conf["spark.eventLog.dir"] == "/spark/eventLog"
+
+
+def test_yaml_templates_are_supported_without_mutating_source(invocation, tmp_path):
+    template = tmp_path / "pod-template.yaml"
+    source = f"""\
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    spark-monitor: enabled
+spec:
+  containers:
+  - name: spark-kubernetes
+    volumeMounts:
+    - name: shared
+      mountPath: /share
+    - name: test-shared
+      mountPath: {tmp_path}
+  volumes:
+  - name: shared
+    persistentVolumeClaim:
+      claimName: shared-pvc
+  - name: test-shared
+    persistentVolumeClaim:
+      claimName: test-pvc
+"""
+    template.write_text(source)
+    values = list(invocation)
+    for flag in ("--driver-pod-template", "--executor-pod-template"):
+        values[values.index(flag) + 1] = str(template)
+
+    args, plan = parsed_plan(values)
+
+    assert plan["driver_template"]["metadata"]["labels"]["spark-monitor"] == "enabled"
+    assert plan["executor_template"]["metadata"]["labels"]["spark-monitor"] == "enabled"
+    assert template.read_text() == source
+    assert args.driver_pod_template.suffix == ".yaml"
 
 
 def test_templates_enforce_arm_uid_and_disk_scratch_without_mutating_base(invocation):
@@ -262,7 +307,7 @@ def test_automatic_prefix_discovery_is_forwarded_without_explicit_shards(invocat
     assert args.auto_prefix_shards is True
     assert "--prefix-shard" not in plan["command"]
     assert "--auto-prefix-shards" in plan["command"]
-    assert plan["command"][plan["command"].index("--max-prefix-shards") + 1] == "100000"
+    assert plan["command"][plan["command"].index("--max-prefix-shards") + 1] == "1000000"
 
 
 @pytest.mark.parametrize(
@@ -319,6 +364,31 @@ def test_normalizer_cli_forwards_auxiliary_retention_to_config(
     entrypoint.main()
     assert seen[0]["retain_s3_auxiliary"] is retain
     assert json.loads(capsys.readouterr().out) == {"passed": True}
+
+
+def test_normalizer_cli_uses_expanded_admission_defaults():
+    entrypoint = load_script("tokenplan_normalize")
+    config = entrypoint.build_config(
+        [
+            "--input-uri",
+            "s3://input/day/",
+            "--output-uri",
+            "s3://output/day/",
+            "--prefix-shard",
+            "user/",
+        ]
+    )
+    assert config.max_output_objects is None
+    assert config.max_partition_objects == 20_000_000
+    assert config.scope_memory_bytes == 256 * 1024**2
+    assert config.max_scope_snapshots == 10_000
+    assert config.max_scope_summaries == 1_000_000
+    assert config.max_scope_summary_bytes == 512 * 1024**2
+    assert config.max_input_object_bytes == 2 * 1024**3
+    assert config.max_routing_bytes == 4 * 1024**3
+    assert config.max_routing_snapshots == 2_000_000
+    assert config.max_root_bytes == 2 * 1024**3
+    assert config.max_prefix_shards == 1_000_000
 
 
 def test_normalizer_cli_forwards_automatic_prefix_discovery(

@@ -623,7 +623,7 @@ def _validate_node(
             "source_type",
             "specific_source",
         },
-        optional={"sessionless_chunk_id"},
+        optional={"end_user_id", "sessionless_chunk_id"},
     )
     source_file = _string(
         metadata["source_file"], f"{path}/metadata/source_file", nonempty=True
@@ -648,6 +648,8 @@ def _validate_node(
     _integer(metadata["line_no"], f"{path}/metadata/line_no")
     for field in ("created_at", "model", "user_id", "session_id"):
         _string(metadata[field], f"{path}/metadata/{field}")
+    if "end_user_id" in metadata:
+        _string(metadata["end_user_id"], f"{path}/metadata/end_user_id")
     chunk_id = metadata.get("sessionless_chunk_id", "")
     if "sessionless_chunk_id" in metadata:
         _string(chunk_id, f"{path}/metadata/sessionless_chunk_id", nonempty=True)
@@ -1043,6 +1045,8 @@ def _project_trajectory(
         },
         "normalization_audit": _project_audit(node.normalization_audit),
     }
+    if node.metadata.end_user_id:
+        result["metadata"]["end_user_id"] = node.metadata.end_user_id
     if node.metadata.sessionless_chunk_id:
         result["metadata"]["sessionless_chunk_id"] = node.metadata.sessionless_chunk_id
     if node.multimodal_file_mapping:

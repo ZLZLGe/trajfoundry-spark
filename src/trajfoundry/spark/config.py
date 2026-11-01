@@ -32,7 +32,7 @@ class SparkNormalizeConfig:
     # bounded prefix names are collected by the driver; object keys/bodies are
     # still listed and read by the normal executor partitions.
     auto_prefix_shards: bool = False
-    max_prefix_shards: int = 100_000
+    max_prefix_shards: int = 1_000_000
     input_credentials_path: str | None = None
     output_credentials_path: str | None = None
     retain_s3_auxiliary: bool = False
@@ -52,17 +52,19 @@ class SparkNormalizeConfig:
     executor_memory_overhead: str | None = None
     shuffle_partitions: int | None = None
     default_parallelism: int | None = None
-    # Count admission limits remain fail-closed, but metadata is disk-streamed.
-    max_output_objects: int = 2_000_000
-    max_partition_objects: int = 2_000_000
-    max_input_object_bytes: int = 64 * 1024 * 1024
-    scope_memory_bytes: int = 64 * 1024 * 1024
-    max_scope_snapshots: int = 1000
-    max_scope_summaries: int = 100_000
-    max_scope_summary_bytes: int = 64 * 1024 * 1024
-    max_routing_bytes: int = 256 * 1024 * 1024
-    max_routing_snapshots: int = 250_000
-    max_root_bytes: int = 64 * 1024 * 1024
+    # The Driver-side inventory is disk-streamed, so the total output count is
+    # unlimited by default.  A positive integer remains available for bounded
+    # smoke tests or deployments that explicitly want an admission limit.
+    max_output_objects: int | None = None
+    max_partition_objects: int = 20_000_000
+    max_input_object_bytes: int = 2 * 1024 * 1024 * 1024
+    scope_memory_bytes: int = 256 * 1024 * 1024
+    max_scope_snapshots: int = 10_000
+    max_scope_summaries: int = 1_000_000
+    max_scope_summary_bytes: int = 512 * 1024 * 1024
+    max_routing_bytes: int = 4 * 1024 * 1024 * 1024
+    max_routing_snapshots: int = 2_000_000
+    max_root_bytes: int = 2 * 1024 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if not self.input_uri.startswith("s3://"):
@@ -96,8 +98,11 @@ class SparkNormalizeConfig:
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_output_objects is not None and (
+            type(self.max_output_objects) is not int or self.max_output_objects <= 0
+        ):
+            raise ValueError("max_output_objects must be a positive integer or None")
         for name in (
-            "max_output_objects",
             "max_partition_objects",
             "max_input_object_bytes",
             "scope_memory_bytes",

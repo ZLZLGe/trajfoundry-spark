@@ -53,6 +53,84 @@ def test_build_scope_materializes_one_trajectory_without_sqlite() -> None:
     assert result.origins[0]["captured_at"] == "1970-01-01T00:00:01.234Z"
 
 
+def test_build_scope_serializes_end_user_metadata_separately() -> None:
+    snapshot = _snapshot().model_copy(update={"end_user_id": "end-user"})
+
+    artifact = serialize_trajectory(build_scope([snapshot])[0].node)
+    payload = json.loads(artifact.payload)
+
+    assert payload["metadata"]["user_id"] == "no_user_id"
+    assert payload["metadata"]["end_user_id"] == "end-user"
+
+
+def test_build_scope_derived_fields_survive_sorted_json_round_trip() -> None:
+    snapshot = Snapshot(
+        source_path="mismatch.json",
+        source_sha256="a" * 64,
+        session_id="session-mismatch",
+        thread_id="thread-mismatch",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+        history=[Message(role="user", content="lookup")],
+        response=[
+            Message(
+                role="assistant",
+                content="",
+                reasoning_content="checking",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        function=FunctionCall(
+                            name="lookup",
+                            arguments={"zeta": 1, "alpha": 2},
+                        ),
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                content="matched",
+                tool_call_id="call-1",
+                name="lookup",
+            ),
+            Message(role="assistant", content="done", reasoning_content=""),
+        ],
+        tools=[
+            ToolDefinition(
+                name="lookup",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "alpha": {"type": "string"},
+                        "zeta": {"type": "string"},
+                    },
+                },
+            )
+        ],
+        captured_at="2026-10-15T00:00:00Z",
+        wire_complete=True,
+    )
+
+    built = build_scope([snapshot])
+    assert len(built) == 1
+    node = built[0].node
+    assert node.tool_call_check.mismatches[0].type_mismatch is not None
+    assert [
+        mismatch.arg for mismatch in node.tool_call_check.mismatches[0].type_mismatch
+    ] == ["alpha", "zeta"]
+
+    artifact = serialize_trajectory(node, built[0].origins)
+    restored = parse_trajectory_record(json.loads(artifact.payload))
+    validate_derived_fields(restored)
+    assert restored.metadata.sub_session_id == 0
+    assert restored.tool_call_check.mismatches[0].type_mismatch is not None
+    assert [
+        mismatch.arg
+        for mismatch in restored.tool_call_check.mismatches[0].type_mismatch
+    ] == ["alpha", "zeta"]
+
+
 def test_build_scope_is_empty_for_no_snapshots() -> None:
     assert build_scope([]) == ()
 

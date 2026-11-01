@@ -115,7 +115,7 @@ def discover_prefix_shards(
     endpoint_url: str | None,
     region_name: str,
     input_credentials_path: str | None = None,
-    max_prefix_shards: int = 100_000,
+    max_prefix_shards: int = 1_000_000,
 ) -> Iterator[str]:
     """Discover one-level user prefixes without listing input objects.
 

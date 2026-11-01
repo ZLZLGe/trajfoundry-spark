@@ -771,6 +771,7 @@ def _trajectory_from_leaf(
             created_at=leaf.captured_at,
             model=leaf.model,
             user_id=leaf.user_id or "no_user_id",
+            end_user_id=leaf.end_user_id,
             session_id=session_id or "no_session_id",
             sessionless_chunk_id=leaf.sessionless_chunk_id if not session_id else "",
             source_type=source_type,

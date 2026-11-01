@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from trajfoundry.export import decode_session_filename
 from trajfoundry.models import Message, Metadata, TrajectoryNode
 from trajfoundry.quality import enrich_trajectory
 from trajfoundry.spark.output import (
@@ -69,6 +70,40 @@ def test_manifest_accumulator_publishes_v4_metadata_and_counts() -> None:
     assert manifest["created_at"] == "2026-10-02T00:00:00Z"
     assert manifest["counts"]["accepted"] == 1
     assert manifest["files"][0]["sha256"] == artifact.description.sha256
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        pytest.param("s" * 189, id="filename-crosses-200"),
+        pytest.param("s" * 200, id="full-safe-id"),
+        pytest.param("s" * 600, id="long-s3-name"),
+        pytest.param("会话/{}" * 20, id="escaped-s3-name"),
+    ],
+)
+def test_spark_serialization_and_manifest_accept_long_session_names(
+    session_id: str,
+) -> None:
+    node = _trajectory()
+    node.metadata.session_id = session_id
+    accumulator = ManifestAccumulator(
+        input_root="s3://bucket/input/",
+        input_format="tokenplan",
+        config_hash="b" * 64,
+    )
+
+    artifact = accumulator.add_trajectory(
+        node,
+        ({"source_ref": "req_001.json", "sha256": "a" * 64},),
+    )
+    manifest = json.loads(accumulator.manifest_bytes())
+
+    assert len(artifact.filename) > 200
+    assert len(("output/dt=2026-10-14/" + artifact.filename).encode()) <= 1024
+    assert decode_session_filename(artifact.filename) == (session_id, 0)
+    assert json.loads(artifact.payload)["metadata"]["session_id"] == session_id
+    assert manifest["counts"]["accepted"] == 1
+    assert manifest["files"] == [artifact.description.manifest_entry()]
 
 
 @pytest.mark.parametrize(

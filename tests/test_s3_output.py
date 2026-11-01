@@ -4,7 +4,7 @@ from typing import Any
 import orjson
 import pytest
 
-from trajfoundry.export import SCHEMA_VERSION
+from trajfoundry.export import SCHEMA_VERSION, decode_session_filename, session_filename
 from trajfoundry.models import (
     AuditIssue,
     AuditTag,
@@ -275,14 +275,90 @@ def test_real_and_synthesized_no_session_ids_have_unambiguous_names() -> None:
     )
 
 
-def test_unsafe_real_session_id_is_rejected() -> None:
-    node = _trajectory("unsafe.json")
-    node.metadata.session_id = "bad/session"
-
-    with pytest.raises(ValueError, match="session_id must contain"):
-        S3OutputSet(FakeS3Client(), _location()).write_trajectory(
-            node, [_origin("unsafe.json")]
+def test_unsafe_real_session_id_gets_stable_safe_filename() -> None:
+    def write(client: FakeS3Client) -> str:
+        node = _trajectory("unsafe.json")
+        node.metadata.session_id = "bad/session"
+        output = S3OutputSet(client, _location())
+        output.write_trajectory(node, [_origin("unsafe.json")])
+        output.close(input_root="s3://bucket/input/", config_hash="config")
+        trajectory = next(
+            item for item in output.written_objects if item.path != "lineage.jsonl"
         )
+        payload = client.objects[(trajectory.bucket, trajectory.key)]
+        assert orjson.loads(payload)["metadata"]["session_id"] == "bad/session"
+        return trajectory.path
+
+    first = write(FakeS3Client())
+    second = write(FakeS3Client())
+
+    assert first == second
+    assert first == "badsession_bad_x2F_session_sub_0.jsonl"
+    assert first.endswith("_sub_0.jsonl")
+    assert "/" not in first
+    assert decode_session_filename(first) == ("bad/session", 0)
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        "sess_{24hex}",
+        "literal_x7B_/marker",
+        "前缀/会话",
+        "two__underscores/{and}\\slash",
+    ],
+)
+def test_unsafe_session_filename_round_trips_without_hash(session_id: str) -> None:
+    filename = session_filename(session_id, 7)
+
+    assert filename.startswith("badsession_")
+    assert "sha256" not in filename
+    assert decode_session_filename(filename) == (session_id, 7)
+
+
+def test_session_filename_escapes_actual_tokenplan_session_id() -> None:
+    filename = session_filename("sess_{24hex}", 0)
+
+    assert filename == "badsession_sess__x7B_24hex_x7D__sub_0.jsonl"
+    assert decode_session_filename(filename) == ("sess_{24hex}", 0)
+
+
+def test_reserved_marker_prefix_does_not_make_safe_ids_ambiguous() -> None:
+    for session_id in ("badsession_bad_x2F_session", "no_session_id_real"):
+        filename = session_filename(session_id, 0)
+
+        assert filename.startswith("_safe_session_")
+        assert decode_session_filename(filename) == (session_id, 0)
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        pytest.param("s" * 200, id="previously-failing-safe-id"),
+        pytest.param("s" * 100_000, id="long-safe-id"),
+        pytest.param("会话/{literal_x7B_}" * 10_000, id="long-escaped-id"),
+        pytest.param("badsession_" + "s" * 100_000, id="long-reserved-prefix"),
+    ],
+)
+def test_long_session_filenames_preserve_full_reversible_identity(
+    session_id: str,
+) -> None:
+    filename = session_filename(session_id, 123)
+
+    assert len(filename) > 200
+    assert filename.endswith("_sub_123.jsonl")
+    assert "/" not in filename
+    assert decode_session_filename(filename) == (session_id, 123)
+    assert session_filename(session_id + "b", 123) != filename
+
+
+def test_legacy_longsession_marker_still_decodes() -> None:
+    session_id = "s" * 200
+
+    assert decode_session_filename(f"_longsession_{session_id}_sub_0.jsonl") == (
+        session_id,
+        0,
+    )
 
 
 def test_large_object_uses_multipart_and_records_streaming_digest() -> None:

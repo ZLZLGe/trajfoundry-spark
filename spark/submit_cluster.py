@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 PROFILES = {"starter": 16, "half": 32, "scale": 48}
 LOCAL_DIR = "/tmp/trajfoundry-spark-local"
+EVENT_LOG_DIR = "/spark/eventLog"
 PROTECTED_JOB_FLAGS = {
     "--input-uri",
     "--output-uri",
@@ -71,13 +72,13 @@ def parser() -> argparse.ArgumentParser:
         "--driver-pod-template",
         type=absolute,
         required=True,
-        help="non-secret JSON Pod template; JSON is valid YAML",
+        help="non-secret JSON or YAML Pod template",
     )
     result.add_argument(
         "--executor-pod-template",
         type=absolute,
         required=True,
-        help="non-secret JSON Pod template",
+        help="non-secret JSON or YAML Pod template",
     )
     result.add_argument("--container-name", default="spark-kubernetes")
     result.add_argument("--image", required=True)
@@ -117,7 +118,7 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="discover immediate user prefixes under the input URI on one Spark partition",
     )
-    result.add_argument("--max-prefix-shards", type=positive, default=100_000)
+    result.add_argument("--max-prefix-shards", type=positive, default=1_000_000)
     result.add_argument("--endpoint-url", required=True)
     result.add_argument("--region-name", default="us-east-1")
     result.add_argument("--input-credentials-file", type=absolute)
@@ -156,7 +157,7 @@ def parser() -> argparse.ArgumentParser:
         "--job-arg",
         action="append",
         default=[],
-        help="repeat for non-secret normalizer arguments, e.g. --job-arg=--max-output-objects --job-arg=100000",
+        help="repeat for non-secret normalizer arguments, e.g. --job-arg=--max-output-objects --job-arg=100000 or --job-arg=unlimited",
     )
     return result
 
@@ -201,9 +202,27 @@ def check_credentials_file(path: Path, expected_uid: int) -> None:
 
 def prepare_template(args, path: Path, *, driver: bool, pod_name: str) -> dict:
     # Templates contain scheduling/mount configuration, not literal credentials.
-    value = json.loads(path.read_text())
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ModuleNotFoundError as error:
+            raise ValueError(
+                "YAML pod templates require the PyYAML dependency in the submitter environment"
+            ) from error
+        try:
+            value = yaml.safe_load(text)
+        except yaml.YAMLError as error:
+            raise ValueError("template must be valid YAML") from error
+    else:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise ValueError("template must be valid JSON (or use .yaml/.yml)") from error
+    if not isinstance(value, dict):
+        raise TypeError("template must be a Kubernetes Pod object")
     if value.get("kind") != "Pod":
-        raise ValueError("template must be a JSON Kubernetes Pod")
+        raise ValueError("template must be a Kubernetes Pod")
     value = copy.deepcopy(value)
     spec = value.setdefault("spec", {})
     containers = spec.get("containers", [])
@@ -231,6 +250,57 @@ def prepare_template(args, path: Path, *, driver: bool, pod_name: str) -> dict:
         spec.pop("activeDeadlineSeconds", None)
     volumes = spec.setdefault("volumes", [])
     mounts = container.setdefault("volumeMounts", [])
+
+    # The platform Spark defaults use /spark/eventLog.  The supplied ARM
+    # template mounts the shared event PVC at /share (with subPath=dsj), but
+    # does not mount that PVC at the event-log path.  Mount the same PVC a
+    # second time in the generated per-run template.  This keeps the source
+    # YAML unchanged while making the configured event-log directory writable
+    # and persistent for the Flamingo History/Listener integration.
+    event_volume = next(
+        (
+            item
+            for item in volumes
+            if item.get("name") == "spark-event-nfs"
+            or (
+                isinstance(item.get("persistentVolumeClaim"), dict)
+                and item["persistentVolumeClaim"].get("claimName")
+                == "spark-event-nfs-pvc"
+            )
+        ),
+        None,
+    )
+    if event_volume is not None and not any(
+        item.get("mountPath") == EVENT_LOG_DIR for item in mounts
+    ):
+        event_mount = next(
+            (
+                item
+                for item in mounts
+                if item.get("name") == event_volume["name"]
+                and item.get("mountPath") == "/share"
+            ),
+            None,
+        )
+        event_log_mount = {"name": event_volume["name"], "mountPath": EVENT_LOG_DIR}
+        # Reuse the template's writable shared subPath (currently `dsj`).
+        # Mounting the PVC root would create the directory but is not writable
+        # by the application UID on this cluster.
+        if event_mount and event_mount.get("subPath"):
+            event_subpath = event_mount["subPath"]
+            try:
+                relative_control = args.control_dir.relative_to(Path("/share"))
+            except ValueError:
+                relative_control = None
+            if relative_control is not None and event_subpath == "dsj":
+                # The `/share` mount is backed by the PVC's `dsj` subPath.
+                # Bind this run's event directory rather than the unwritable
+                # `dsj` root itself.
+                event_subpath = str(
+                    Path(event_subpath) / relative_control / "eventLog"
+                )
+            event_log_mount["subPath"] = event_subpath
+        mounts.append(event_log_mount)
     shared_volumes = {
         item.get("name")
         for item in volumes
@@ -424,7 +494,7 @@ def make_plan(args, *, run_id: str | None = None) -> dict:
         "spark.kubernetes.driver.limit.cores": str(args.driver_cores),
         "spark.driver.memory": f"{args.driver_memory_gib}g",
         "spark.driver.memoryOverhead": f"{args.driver_overhead_gib}g",
-        "spark.driver.maxResultSize": "64m",
+        "spark.driver.maxResultSize": "1g",
         "spark.executor.instances": str(instances),
         "spark.executor.cores": "8",
         "spark.kubernetes.executor.request.cores": "8",
@@ -446,6 +516,15 @@ def make_plan(args, *, run_id: str | None = None) -> dict:
         "spark.kubernetes.submission.waitAppCompletion": "true",
         "spark.kubernetes.executor.deleteOnTermination": "true",
         "spark.kubernetes.driver.service.deleteOnTermination": "true",
+        # Persist Spark's structured event log for the platform History Server.
+        # The supplied Pod template/platform must provide this path as a
+        # writable shared mount; otherwise the log remains local to the Pod.
+        "spark.eventLog.enabled": "true",
+        "spark.eventLog.dir": EVENT_LOG_DIR,
+        # The Spark image currently supplies this listener through
+        # spark-defaults.conf.  Keep it explicit so a different Spark conf
+        # directory cannot silently remove Flamingo platform monitoring.
+        "spark.extraListeners": "flamingo.spark.listener.SparkFlamingoListener",
     }
     # Do not set spark.executor.pyspark.memory: Python shares the explicit 48g
     # overhead envelope; adding it would add another Pod memory request/limit.
@@ -492,15 +571,13 @@ def make_plan(args, *, run_id: str | None = None) -> dict:
     command.extend(
         [
             "--max-routing-mib",
-            # The 2026-09-15 data contains a single no-session hotspot whose
-            # serialized semantic routing plan is about 1.25 GiB.  Keep the
-            # fail-closed guard, but leave enough headroom for that real
-            # workload instead of making every retry fail at 1 GiB.
-            "2048",
+            # A known no-session hotspot has a serialized routing plan of
+            # about 1.25 GiB. Keep a finite guard with room for larger scopes.
+            "4096",
             "--max-routing-snapshots",
-            "1000000",
+            "2000000",
             "--max-root-mib",
-            "64",
+            "2048",
         ]
     )
     command.extend(args.job_arg)
@@ -573,6 +650,10 @@ def main(argv=None) -> int:
                 "private control directory requires submitter and Pod UID to match"
             )
         args.control_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+        # This directory is part of the shared PVC mounted into the Driver.
+        # It is created before Kubernetes evaluates the generated subPath
+        # mount for /spark/eventLog.
+        (args.control_dir / "eventLog").mkdir(mode=0o700, exist_ok=False)
         control_created = True
         stage = "prepare_submission"
         for filename, content in (

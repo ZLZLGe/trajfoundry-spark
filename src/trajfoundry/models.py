@@ -263,6 +263,7 @@ class Metadata(StrictModel):
     created_at: str = ""
     model: str = ""
     user_id: str = ""
+    end_user_id: str = ""
     session_id: str = ""
     sessionless_chunk_id: str = ""
     sub_session_id: int = Field(default=0, ge=0)
@@ -356,6 +357,7 @@ class Snapshot(StrictModel):
     request_id: str = ""
     model: str = ""
     user_id: str = ""
+    end_user_id: str = ""
     harness: str = "unknown"
     instructions: str = ""
     multimodal_file_mapping: list[MediaMapping] = Field(default_factory=list)

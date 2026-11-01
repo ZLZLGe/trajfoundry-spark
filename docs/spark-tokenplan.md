@@ -292,7 +292,7 @@ Services、ConfigMaps 均已核对归零；临时凭据副本已删除，原账�
 正式全量也可以改用 `--auto-prefix-shards`：Spark 会在一个 Executor 分区上用
 `Delimiter="/"` 扫描日期目录的第一层用户前缀，只将有界的前缀名列表收集到
 Driver，然后沿用 Executor 侧对象清单/读取流程；不会把日期下百万对象的清单
-收集到 Driver。默认最多接受 100,000 个前缀，可用 `--max-prefix-shards`
+收集到 Driver。默认最多接受 1,000,000 个前缀，可用 `--max-prefix-shards`
 调整；自动模式不得同时传 `--prefix-shard`。如果 S3 兼容端点忽略 `Delimiter`、
 把嵌套对象返回到 `Contents`，或返回畸形清单，任务会直接失败而不发布部分结果，
 避免把空的/不完整的前缀发现当作成功。
@@ -382,7 +382,7 @@ s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=YYYY-MM-DD/
 独立的消息前缀组件继续处理。真实 session 保留整体分支编号；含路由证据的
 块保留块内整体规划，不按协议或随机桶再拆，也不回退成跨块整用户规划。
 
-默认每组件探测上限为 `--scope-memory-mib 64` / `--max-scope-snapshots 1000`；
+默认每组件探测上限为 `--scope-memory-mib 256` / `--max-scope-snapshots 10000`；
 达到任一上限即使用磁盘快照、精确前缀索引、磁盘去重和逐 root 物化。
 即使没达到上述上限，只要有子代理关联、spawn 或 agent-message 证据，也使用
 磁盘路径：诊断共享目标集合并落盘，单根诊断先检查预算再解码，避免诊断数与
@@ -395,8 +395,9 @@ s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=YYYY-MM-DD/
 硬限制，也不能证明任意数据都不会 OOM；复杂子代理规划仍是重点验收边界。
 
 Driver 不收集 Snapshot/Trajectory 正文，输出描述符和 manifest 已改为 SQLite
-落盘及流式生成；仅保留每分区的小回执。默认 `--max-output-objects 2000000`、
-`--max-partition-objects 2000000` 为数量保护，不再对应同等规模的内存列表。
+落盘及流式生成；仅保留每分区的小回执。总输出对象默认不设上限；如需显式
+限制可传 `--max-output-objects N`，也可传 `--max-output-objects unlimited`。
+`--max-partition-objects 20000000` 仍是单分区数量保护，不再对应同等规模的内存列表。
 构建/发布先通过并行动作执行，再读取磁盘缓存的小回执，避免逐分区拉取时
 将业务阶段意外串行化。磁盘兜底主要降低峰值，提速来自下载/组件/分区并行，
 不能把磁盘路径本身描述为必然更快。
@@ -425,8 +426,10 @@ Driver 不收集 Snapshot/Trajectory 正文，输出描述符和 manifest 已改
 每个 Python worker 的额度。** 每个 Executor 最多同时运行 8 个单核 task，Python
 进程、native buffers 等共享 48 GiB overhead，不能据此保证巨型单 scope 不会 OOM。
 Driver 默认另计 4 核、8 GiB JVM + 4 GiB overhead，可通过对应参数显式调整。
-默认路由保护为 `--max-routing-mib 1024 --max-routing-snapshots 1000000`，
-单根保护仍为 `--max-root-mib 64`；放宽路由上限不代表可以放宽根的内存边界。
+默认输入对象上限为 2048 MiB，单 snapshot/root 上限为 2048 MiB；routing
+保护为 `--max-routing-mib 4096 --max-routing-snapshots 2000000`。Driver 摘要
+最多 1,000,000 项 / 512 MiB，`spark.driver.maxResultSize` 为 1 GiB。以上均为
+放宽后的准入预算，不是 RSS 保证；超大单条数据和复杂路由仍可能耗尽 Executor 内存。
 
 提交器将 `spark.kubernetes.driver.master` 显式设为与提交端相同的 HTTPS API
 地址，避免某些节点解析默认 `kubernetes.default.svc` 失败。TLS、CA、主机名
@@ -478,6 +481,11 @@ Spark local dir、Python `TMPDIR` 和 Ivy 路径，不使用 tmpfs，不把 SQLi
 S3 轨迹由各 Executor 上传后流式回读验证 SHA256/字节数，再返回小型成功回执；
 Driver 校验合并后的 lineage/diagnostics 后最后发布 manifest。既有同名不同内容
 拒绝覆盖。空前缀检查和 HEAD 冲突检查不是分布式锁，目标日期仍须由本次运行独占。
+
+轨迹文件名的编码、解码不再设置 200 字符的应用层上限；安全字符 ID 直接保留，
+其余 ID 使用完整、可逆的 UTF-8 转义，不截断、不改成哈希。实际可写长度由存储
+决定：S3 的完整对象 key（包括输出前缀）最多 1024 字节，本地文件名单段通常
+最多 255 字节。
 
 默认模式下，输出凭据除 LIST/PUT/GET 外还需要目标前缀下的 DeleteObject 权限：
 Driver 合并并校验临时清单、lineage 与诊断分片后，删除本次临时分片，再发布

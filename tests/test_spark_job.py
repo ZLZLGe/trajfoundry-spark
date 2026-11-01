@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -251,6 +252,17 @@ def test_config_hash_includes_normalizer_revision():
     before = job._config_hash(config)
     with patch.object(job, "NORMALIZER_REVISION", "synthetic-next-revision"):
         assert job._config_hash(config) != before
+
+
+def test_config_hash_includes_output_object_limits():
+    config = SparkNormalizeConfig(
+        "s3://fake/in/",
+        "s3://fake/out/",
+        prefix_shards=("user/",),
+    )
+    assert job._config_hash(config) != job._config_hash(
+        replace(config, max_output_objects=1)
+    )
 
 
 def test_automatic_prefix_resolution_collects_only_bounded_names(monkeypatch):

@@ -56,7 +56,7 @@ from .source import (
 from .storage import create_output_store
 
 LOGGER = logging.getLogger(__name__)
-_MAX_TRAJECTORY_BYTES = 512 * 1024 * 1024
+_MAX_TRAJECTORY_BYTES = 2 * 1024 * 1024 * 1024
 _RUNTIME_SOURCE_HASH: str | None = None
 
 
@@ -271,7 +271,7 @@ def _component_summary(item):
     from .component_plan import summarize_snapshot
 
     value = item[1]
-    if len(value[3].encode()) > 4096:
+    if len(value[3].encode()) > 64 * 1024:
         raise ValueError("aggregation identity exceeds byte budget")
     return (value[2], value[3]), summarize_snapshot(
         Snapshot.model_validate_json(value[-1])
@@ -644,10 +644,15 @@ def _config_hash(config: SparkNormalizeConfig) -> str:
         "spark_conf": config.spark_conf(),
         "spark_execution_revision": "bounded-components-v5-external-prefix-sort",
         "retain_s3_auxiliary": config.retain_s3_auxiliary,
+        "max_output_objects": config.max_output_objects,
+        "max_partition_objects": config.max_partition_objects,
         "scope_memory_bytes": config.scope_memory_bytes,
         "max_scope_snapshots": config.max_scope_snapshots,
+        "max_scope_summaries": config.max_scope_summaries,
+        "max_scope_summary_bytes": config.max_scope_summary_bytes,
         "max_input_object_bytes": config.max_input_object_bytes,
         "max_root_bytes": config.max_root_bytes,
+        "max_trajectory_bytes": _MAX_TRAJECTORY_BYTES,
         "max_routing_bytes": config.max_routing_bytes,
         "max_routing_snapshots": config.max_routing_snapshots,
     }
@@ -1042,7 +1047,10 @@ def _run_spark_job(
     reporter.set_phase("merge_inventory")
     for item in published.toLocalIterator(prefetchPartitions=False):
         output_objects += item["object_count"]
-        if output_objects > config.max_output_objects:
+        if (
+            config.max_output_objects is not None
+            and output_objects > config.max_output_objects
+        ):
             raise RuntimeError(
                 "driver output descriptor limit exceeded; no manifest published"
             )
