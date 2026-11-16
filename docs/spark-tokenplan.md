@@ -419,17 +419,34 @@ Driver 不收集 Snapshot/Trajectory 正文，输出描述符和 manifest 已改
 | 档位 | Executor 数 × 核数 | 单 Executor JVM + overhead | Executor 总资源 |
 | --- | --- | --- | --- |
 | `starter`（默认） | 16 × 8 | 16 GiB + 48 GiB = 64 GiB | 128 核、1 TiB |
+| `half` | 32 × 8 | 16 GiB + 48 GiB = 64 GiB | 256 核、2 TiB |
 | `scale`（只配置，不自动扩容） | 48 × 8 | 16 GiB + 48 GiB = 64 GiB | 384 核、3 TiB |
 
-两档均不设置 `spark.executor.pyspark.memory`，并关闭额外 off-heap 内存，避免在
+三档均不设置 `spark.executor.pyspark.memory`，并关闭额外 off-heap 内存，避免在
 64 GiB 之外另加 Python 内存请求。**64 GiB 是整个 Executor Pod 的额度，不是
 每个 Python worker 的额度。** 每个 Executor 最多同时运行 8 个单核 task，Python
 进程、native buffers 等共享 48 GiB overhead，不能据此保证巨型单 scope 不会 OOM。
-Driver 默认另计 4 核、8 GiB JVM + 4 GiB overhead，可通过对应参数显式调整。
+Driver 默认另计 4 核、16 GiB JVM + 48 GiB overhead（包含 Python 进程），可通过
+`--driver-memory-gib` 和 `--driver-overhead-gib` 显式调整。因此 `half` 档连同
+Driver 共计 260 核、2,112 GiB；Executor 数量和单个 Executor 的资源额度不变。
 默认输入对象上限为 2048 MiB，单 snapshot/root 上限为 2048 MiB；routing
-保护为 `--max-routing-mib 4096 --max-routing-snapshots 2000000`。Driver 摘要
-最多 1,000,000 项 / 512 MiB，`spark.driver.maxResultSize` 为 1 GiB。以上均为
-放宽后的准入预算，不是 RSS 保证；超大单条数据和复杂路由仍可能耗尽 Executor 内存。
+保护为 `--max-routing-mib 4096 --max-routing-snapshots 2000000`。Cluster 提交器
+默认允许 Driver 分组摘要最多 5,000,000 项、估算总大小最多 4,096 MiB；
+`spark.driver.maxResultSize` 默认为 4 GiB，可通过正整数参数
+`--driver-max-result-size-gib` 调整。摘要估算大小、Spark 每次 action 的序列化结果
+大小和 Python 实际内存占用是不同的量；这些预算不能保证任意日期都能成功。
+需要覆盖摘要预算时，可在调度配置的 `submit_args` 中加入：
+
+```json
+[
+  "--job-arg=--max-scope-summaries", "--job-arg=5000000",
+  "--job-arg=--max-scope-summary-mib", "--job-arg=4096"
+]
+```
+
+以上是当前 Cluster 提交器的默认值；直接运行 normalizer CLI 时，摘要预算仍为
+1,000,000 项 / 512 MiB。使用当前 checkout 且未显式覆盖这些参数的调度节点，
+下次提交会自动采用新值，无需修改节点脚本或重跑已有日期。
 
 提交器将 `spark.kubernetes.driver.master` 显式设为与提交端相同的 HTTPS API
 地址，避免某些节点解析默认 `kubernetes.default.svc` 失败。TLS、CA、主机名

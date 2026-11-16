@@ -134,8 +134,14 @@ def parser() -> argparse.ArgumentParser:
         help="explicit retry mode for an existing S3 output prefix",
     )
     result.add_argument("--driver-cores", type=positive, default=4)
-    result.add_argument("--driver-memory-gib", type=positive, default=8)
-    result.add_argument("--driver-overhead-gib", type=positive, default=4)
+    result.add_argument("--driver-memory-gib", type=positive, default=16)
+    result.add_argument("--driver-overhead-gib", type=positive, default=48)
+    result.add_argument(
+        "--driver-max-result-size-gib",
+        type=positive,
+        default=4,
+        help="serialized result limit per Spark action in GiB; budget Driver memory separately",
+    )
     result.add_argument(
         "--timeout-seconds",
         type=nonnegative,
@@ -494,7 +500,7 @@ def make_plan(args, *, run_id: str | None = None) -> dict:
         "spark.kubernetes.driver.limit.cores": str(args.driver_cores),
         "spark.driver.memory": f"{args.driver_memory_gib}g",
         "spark.driver.memoryOverhead": f"{args.driver_overhead_gib}g",
-        "spark.driver.maxResultSize": "1g",
+        "spark.driver.maxResultSize": f"{args.driver_max_result_size_gib}g",
         "spark.executor.instances": str(instances),
         "spark.executor.cores": "8",
         "spark.kubernetes.executor.request.cores": "8",
@@ -570,6 +576,10 @@ def make_plan(args, *, run_id: str | None = None) -> dict:
         command.append("--allow-existing-output")
     command.extend(
         [
+            "--max-scope-summaries",
+            "5000000",
+            "--max-scope-summary-mib",
+            "4096",
             "--max-routing-mib",
             # A known no-session hotspot has a serialized routing plan of
             # about 1.25 GiB. Keep a finite guard with room for larger scopes.

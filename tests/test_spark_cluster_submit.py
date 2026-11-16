@@ -131,7 +131,7 @@ def test_resource_profiles_have_exact_64_gib_envelope(
     assert conf["spark.executor.cores"] == "8"
     assert conf["spark.executor.memory"] == "16g"
     assert conf["spark.executor.memoryOverhead"] == "48g"
-    assert conf["spark.driver.maxResultSize"] == "1g"
+    assert conf["spark.driver.maxResultSize"] == "4g"
     assert "spark.executor.pyspark.memory" not in conf
     assert "spark.kubernetes.submitInDriver" not in conf
     assert conf["spark.memory.offHeap.enabled"] == "false"
@@ -151,6 +151,63 @@ def test_resource_profiles_have_exact_64_gib_envelope(
         ("--max-root-mib", "2048"),
     ):
         assert plan["command"][plan["command"].index(flag) + 1] == value
+
+
+def test_half_plan_uses_larger_driver_summary_budget(invocation):
+    _, plan = parsed_plan(invocation + ["--profile", "half"])
+    conf = conf_of(plan)
+    assert conf["spark.driver.cores"] == "4"
+    assert conf["spark.driver.memory"] == "16g"
+    assert conf["spark.driver.memoryOverhead"] == "48g"
+    assert conf["spark.driver.maxResultSize"] == "4g"
+    assert conf["spark.executor.instances"] == "32"
+    assert conf["spark.executor.cores"] == "8"
+    assert conf["spark.executor.memory"] == "16g"
+    assert conf["spark.executor.memoryOverhead"] == "48g"
+    assert plan["total_executor_cores"] == 256
+    assert plan["total_executor_memory_gib"] == 2048
+    command = plan["command"]
+    entrypoint = "local://" + str(ROOT / "spark/tokenplan_normalize.py")
+    normalizer = load_script("tokenplan_normalize")
+    config = normalizer.build_config(command[command.index(entrypoint) + 1 :])
+    assert config.max_scope_summaries == 5_000_000
+    assert config.max_scope_summary_bytes == 4096 * 1024 * 1024
+
+
+def test_driver_and_summary_budgets_can_still_be_overridden(invocation):
+    _, plan = parsed_plan(
+        invocation
+        + [
+            "--driver-memory-gib",
+            "8",
+            "--driver-overhead-gib",
+            "4",
+            "--driver-max-result-size-gib",
+            "1",
+            "--job-arg=--max-scope-summaries",
+            "--job-arg=1000000",
+            "--job-arg=--max-scope-summary-mib",
+            "--job-arg=512",
+        ]
+    )
+    conf = conf_of(plan)
+    assert conf["spark.driver.memory"] == "8g"
+    assert conf["spark.driver.memoryOverhead"] == "4g"
+    assert conf["spark.driver.maxResultSize"] == "1g"
+    command = plan["command"]
+    entrypoint = "local://" + str(ROOT / "spark/tokenplan_normalize.py")
+    normalizer = load_script("tokenplan_normalize")
+    config = normalizer.build_config(command[command.index(entrypoint) + 1 :])
+    assert config.max_scope_summaries == 1_000_000
+    assert config.max_scope_summary_bytes == 512 * 1024 * 1024
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_driver_result_limit_must_be_positive(invocation, value):
+    with pytest.raises(SystemExit):
+        submit.parser().parse_args(
+            invocation + ["--driver-max-result-size-gib", value]
+        )
 
 
 def test_event_log_configuration_is_forwarded(invocation):
