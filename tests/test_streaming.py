@@ -14,7 +14,7 @@ from trajfoundry.models import (
     Snapshot,
     ToolCall,
 )
-from trajfoundry.streaming import streaming_prefix_leaves
+from trajfoundry.streaming import message_prefix_token, streaming_prefix_leaves
 
 
 def snap(
@@ -307,6 +307,94 @@ def test_content_and_tool_call_differences_still_branch() -> None:
         "result-short",
         "result-long",
     }
+
+
+def _call_message(call_id: str, *, name: str = "exec", command: str = "pwd") -> Message:
+    return Message(
+        role="assistant",
+        content="",
+        reasoning_content="",
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                function=FunctionCall(name=name, arguments=f'{{"cmd":"{command}"}}'),
+            )
+        ],
+    )
+
+
+def test_prefix_token_ignores_tool_call_id_but_not_call_content() -> None:
+    upstream = _call_message("chatcmpl-tool-0123456789abcdef")
+    replayed = _call_message("call_fedcba9876543210")
+
+    assert message_prefix_token(upstream) == message_prefix_token(replayed)
+    assert message_prefix_token(upstream) != message_prefix_token(
+        _call_message("call_fedcba9876543210", command="ls")
+    )
+    assert message_prefix_token(upstream) != message_prefix_token(
+        _call_message("call_fedcba9876543210", name="other_tool")
+    )
+    two_calls = replayed.model_copy(
+        update={"tool_calls": [*replayed.tool_calls, *replayed.tool_calls]}
+    )
+    assert message_prefix_token(replayed) != message_prefix_token(two_calls)
+    no_calls = replayed.model_copy(update={"tool_calls": None})
+    assert message_prefix_token(replayed) != message_prefix_token(no_calls)
+
+
+def test_prefix_token_still_binds_tool_results_to_their_call_id() -> None:
+    result = Message(role="tool", content="{}", tool_call_id="call-a", name="exec")
+    other = result.model_copy(update={"tool_call_id": "call-b"})
+
+    assert message_prefix_token(result) != message_prefix_token(other)
+
+
+def test_streaming_folds_prefix_across_rewritten_tool_call_ids() -> None:
+    question = Message(role="user", content="q")
+    short = snap("short", [question], [_call_message("chatcmpl-tool-0123456789abcdef")])
+    longer = snap(
+        "longer",
+        [
+            question,
+            _call_message("call_fedcba9876543210"),
+            Message(
+                role="tool",
+                content="/work",
+                tool_call_id="call_fedcba9876543210",
+                name="exec",
+            ),
+        ],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    )
+
+    result = streaming_prefix_leaves([short, longer])
+
+    assert result.leaves == (longer,)
+    assert result.intermediate_paths == ("short",)
+
+
+def test_streaming_keeps_branch_when_rewritten_call_arguments_differ() -> None:
+    question = Message(role="user", content="q")
+    short = snap("short", [question], [_call_message("chatcmpl-tool-0123456789abcdef")])
+    longer = snap(
+        "longer",
+        [
+            question,
+            _call_message("call_fedcba9876543210", command="ls"),
+            Message(
+                role="tool",
+                content="/work",
+                tool_call_id="call_fedcba9876543210",
+                name="exec",
+            ),
+        ],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    )
+
+    result = streaming_prefix_leaves([short, longer])
+
+    assert {leaf.source_path for leaf in result.leaves} == {"short", "longer"}
+    assert result.intermediate_paths == ()
 
 
 def test_prefix_never_crosses_session_or_thread() -> None:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+import pytest
+
 from trajfoundry.aggregate import aggregate_snapshots
 from trajfoundry.models import (
     CompactionRecord,
@@ -231,6 +233,82 @@ def test_reasoning_differences_are_ignored_but_tool_results_are_not() -> None:
         completed.source_path,
         different_result.source_path,
     }
+
+
+def _call_message(call_id: str, *, name: str = "exec", command: str = "pwd") -> Message:
+    return Message(
+        role="assistant",
+        content="",
+        reasoning_content="",
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                function=FunctionCall(name=name, arguments=f'{{"cmd":"{command}"}}'),
+            )
+        ],
+    )
+
+
+def test_gateway_rewritten_tool_call_ids_do_not_block_prefix_fold() -> None:
+    q1 = user("q1")
+    # The captured response carries the upstream id, while the client replays
+    # the same call under its own id (and answers it with that id) next turn.
+    short = snapshot("short", [q1], [_call_message("chatcmpl-tool-0123456789abcdef")])
+    longer = snapshot(
+        "longer",
+        [
+            q1,
+            _call_message("call_fedcba9876543210"),
+            Message(
+                role="tool",
+                content="/work",
+                tool_call_id="call_fedcba9876543210",
+                name="exec",
+            ),
+        ],
+        [assistant("done")],
+    )
+
+    result = aggregate_snapshots([short, longer])
+
+    assert result.leaves == (longer,)
+    assert result.intermediate == (short,)
+
+
+@pytest.mark.parametrize(
+    "replayed",
+    [
+        {"command": "ls"},
+        {"name": "other_tool"},
+    ],
+)
+def test_rewritten_tool_call_ids_do_not_hide_real_call_differences(
+    replayed: dict[str, str],
+) -> None:
+    q1 = user("q1")
+    short = snapshot("short", [q1], [_call_message("chatcmpl-tool-0123456789abcdef")])
+    longer = snapshot(
+        "longer",
+        [
+            q1,
+            _call_message("call_fedcba9876543210", **replayed),
+            Message(
+                role="tool",
+                content="/work",
+                tool_call_id="call_fedcba9876543210",
+                name=replayed.get("name", "exec"),
+            ),
+        ],
+        [assistant("done")],
+    )
+
+    result = aggregate_snapshots([short, longer])
+
+    assert {item.source_path for item in result.leaves} == {
+        short.source_path,
+        longer.source_path,
+    }
+    assert result.intermediate == ()
 
 
 def test_complete_snapshot_must_prefix_later_history_not_later_response() -> None:
