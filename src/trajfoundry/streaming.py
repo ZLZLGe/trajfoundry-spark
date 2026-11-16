@@ -21,6 +21,14 @@ def message_prefix_token(message: Message) -> bytes:
     same assistant turn with a reduced reasoning envelope (for example without
     response-only metadata), while the model-visible conversation and tool
     call remain identical.
+
+    Assistant tool-call ids are excluded for the same reason.  A gateway or
+    client may rewrite them: the id recorded in a response (for example
+    ``chatcmpl-tool-...``) differs from the id replayed in the next request's
+    history (``call_...``) although the call name and arguments are
+    byte-identical.  The id is a transport label, not model-visible
+    conversation; tool results remain bound to their call by ``tool_call_id``
+    and message order.
     """
 
     if message.role == "assistant":
@@ -28,7 +36,7 @@ def message_prefix_token(message: Message) -> bytes:
             "role": message.role,
             "content": message.content,
             "tool_calls": [
-                call.model_dump(mode="json", exclude_none=False)
+                call.model_dump(mode="json", exclude_none=False, exclude={"id"})
                 for call in message.tool_calls or ()
             ]
             if message.tool_calls is not None

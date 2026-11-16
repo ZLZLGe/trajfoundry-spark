@@ -12,6 +12,7 @@ from trajfoundry.models import (
     AuditIssue,
     FunctionCall,
     MediaMapping,
+    Message,
     ToolCall,
     ToolDefinition,
 )
@@ -146,6 +147,55 @@ def test_empty_eligible_transcript_matches_streaming_builder(tmp_path):
     expected = build_scope([capture])
     actual = tuple(build_scope_bounded([capture], workspace_parent=tmp_path))
 
+    assert actual == expected
+    assert _artifacts(actual) == _artifacts(expected)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("command,folded", [("pwd", True), ("ls", False)])
+def test_rewritten_tool_call_ids_fold_prefix_in_bounded_builder(
+    tmp_path, command, folded
+):
+    def call_message(call_id, command):
+        return assistant(
+            calls=[
+                ToolCall(
+                    id=call_id,
+                    function=FunctionCall(
+                        name="exec", arguments=f'{{"cmd":"{command}"}}'
+                    ),
+                )
+            ]
+        )
+
+    short = snapshot(
+        "short",
+        thread="main",
+        turn="short",
+        history=[user("q")],
+        response=[call_message("chatcmpl-tool-0123456789abcdef", "pwd")],
+    )
+    longer = snapshot(
+        "longer",
+        thread="main",
+        turn="longer",
+        history=[
+            user("q"),
+            call_message("call_fedcba9876543210", command),
+            Message(
+                role="tool",
+                content="/work",
+                tool_call_id="call_fedcba9876543210",
+                name="exec",
+            ),
+        ],
+        response=[assistant("done")],
+    )
+
+    expected = build_scope([short, longer])
+    actual = tuple(build_scope_bounded([short, longer], workspace_parent=tmp_path))
+
+    assert len(actual) == (1 if folded else 2)
     assert actual == expected
     assert _artifacts(actual) == _artifacts(expected)
     assert list(tmp_path.iterdir()) == []
