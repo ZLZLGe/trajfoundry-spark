@@ -75,6 +75,34 @@ _JSON_DECODER = json.JSONDecoder()
 _OMITTED_PAYLOAD = object()
 
 
+def _visible_json_text(value: Any) -> str:
+    """Serialize token-count input without failing on malformed Unicode.
+
+    A capture can contain an embedded JSON block with an escaped lone
+    surrogate (for example ``\\ud800``). The capture itself remains valid
+    JSON text, but decoding that block for media filtering creates a Python
+    string that ``orjson`` cannot encode. Token estimation only needs a stable
+    textual representation, so escape the invalid code points at this
+    boundary. Other encoding/programming errors still propagate.
+    """
+
+    try:
+        return dumps(value, sort_keys=True).decode("utf-8")
+    except TypeError as error:
+        if str(error) != "str is not valid UTF-8: surrogates not allowed":
+            raise
+    except UnicodeEncodeError as error:
+        if error.encoding != "utf-8" or error.reason != "surrogates not allowed":
+            raise
+    return json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def _visible_token_value(value: Any) -> Any:
     """Strip explicit media/opaque payloads without guessing from text size."""
 
@@ -123,7 +151,7 @@ def _visible_token_text(text: str) -> str:
             pieces.append(
                 " "
                 if visible is _OMITTED_PAYLOAD
-                else dumps(visible, sort_keys=True).decode("utf-8")
+                else _visible_json_text(visible)
             )
             cursor = end
         search_from = end
@@ -138,7 +166,7 @@ def _value_tokens(value: Any) -> int:
     text = (
         visible
         if isinstance(visible, str)
-        else dumps(visible, sort_keys=True).decode("utf-8")
+        else _visible_json_text(visible)
     )
     return estimate_tokens(text)
 
