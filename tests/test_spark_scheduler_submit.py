@@ -160,6 +160,109 @@ def test_worker_overrides_and_driver_command_keep_business_routing(config):
     ]
 
 
+def event_log_plan(config, monkeypatch, *, init_containers=None):
+    value = json.loads(config.read_text())
+    value["runs_parent"] = "/share/scheduler-test-runs"
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda path: path == Path(value["runs_parent"]) or original_is_dir(path),
+    )
+    template_path = Path(
+        value["submit_args"][value["submit_args"].index("--driver-pod-template") + 1]
+    )
+    template = json.loads(template_path.read_text())
+    template["spec"]["containers"][0]["volumeMounts"].append(
+        {"name": "spark-event-nfs", "mountPath": "/share", "subPath": "dsj"}
+    )
+    template["spec"]["volumes"].append(
+        {
+            "name": "spark-event-nfs",
+            "persistentVolumeClaim": {"claimName": "spark-event-nfs-pvc"},
+        }
+    )
+    if init_containers is not None:
+        template["spec"]["initContainers"] = init_containers
+    template_path.write_text(json.dumps(template))
+    config.write_text(json.dumps(value))
+    return scheduler.make_plan(scheduler.parser().parse_args(cli(config)))
+
+
+def test_event_log_subpath_is_prepared_by_driver_identity_without_worker_writes(
+    config, monkeypatch
+):
+    existing = {"name": "existing-init", "image": "example/init"}
+    args, plan, _ = event_log_plan(config, monkeypatch, init_containers=[existing])
+    spec = plan["driver_template"]["spec"]
+    init = spec["initContainers"][-1]
+    assert spec["initContainers"][0] == existing
+    assert init["name"] == scheduler.EVENT_LOG_INIT_NAME
+    assert init["image"] == args.image
+    assert init["securityContext"] == spec["containers"][0]["securityContext"]
+    assert init["securityContext"]["runAsUser"] == args.run_as_user
+    assert init["resources"]["requests"] == init["resources"]["limits"]
+    assert init["volumeMounts"] == [
+        {"name": "spark-event-nfs", "mountPath": "/share", "subPath": "dsj"}
+    ]
+    assert init["command"][-1] == str(args.control_dir / "eventLog")
+    event_mount = next(
+        mount
+        for mount in spec["containers"][0]["volumeMounts"]
+        if mount["mountPath"] == scheduler.submit.EVENT_LOG_DIR
+    )
+    assert event_mount["subPath"] == str(
+        Path("dsj") / args.control_dir.relative_to("/share") / "eventLog"
+    )
+    assert not args.control_dir.exists()
+
+
+def test_event_log_preparation_creates_private_directories_and_can_retry(
+    config, tmp_path, monkeypatch
+):
+    _, plan, _ = event_log_plan(config, monkeypatch)
+    command = list(plan["driver_template"]["spec"]["initContainers"][-1]["command"])
+    destination = tmp_path / "run with spaces" / "control" / "eventLog"
+    command[-1] = str(destination)
+    for _ in range(2):
+        subprocess.run(command, capture_output=True, text=True, check=True)
+    for directory in (destination, destination.parent, destination.parent.parent):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert list(destination.iterdir()) == []
+
+
+@pytest.mark.parametrize("blocked", ["symlink", "unwritable"])
+def test_event_log_preparation_rejects_existing_unsafe_directory(
+    config, tmp_path, monkeypatch, blocked
+):
+    _, plan, _ = event_log_plan(config, monkeypatch)
+    command = list(plan["driver_template"]["spec"]["initContainers"][-1]["command"])
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    if blocked == "symlink":
+        destination = tmp_path / "eventLog"
+        destination.symlink_to(target, target_is_directory=True)
+    else:
+        destination = target
+        target.chmod(0o500)
+    before = stat.S_IMODE(target.stat().st_mode)
+    command[-1] = str(destination)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode != 0
+        assert stat.S_IMODE(target.stat().st_mode) == before
+        assert list(target.iterdir()) == []
+    finally:
+        target.chmod(0o700)
+
+
+def test_event_log_init_name_cannot_replace_a_template_container(config, monkeypatch):
+    with pytest.raises(scheduler.Error, match="reserved_event_log_init_container"):
+        event_log_plan(
+            config, monkeypatch, init_containers=[{"name": scheduler.EVENT_LOG_INIT_NAME}]
+        )
+
+
 @pytest.mark.parametrize(
     "value", ["${biz_date}", "2026-02-30", "2026-9-15", "2026-09-15/../other"]
 )

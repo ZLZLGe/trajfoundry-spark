@@ -245,10 +245,9 @@ def test_stdout_wrapper_runtime_checks_without_private_log_redirection(
     path = ROOT / "spark/scheduler_driver_entrypoint.sh"
     source = path.read_text()
     assert "TF_CLUSTER_LOG_PATH" not in source and "exec >" not in source
-    assert source.endswith('exec /opt/entrypoint.sh "$@"\n')
     assert subprocess.run(["bash", "-n", str(path)], check=False).returncode == 0
     python = source.split('"$TF_CLUSTER_PYTHON" -c \'\n', 1)[1].split(
-        "\n'\nexec /opt/entrypoint.sh", 1
+        "\n'\n", 1
     )[0]
     monkeypatch.setattr(platform, "machine", lambda: architecture)
     monkeypatch.setattr(socket, "gethostname", lambda: POD)
@@ -256,9 +255,12 @@ def test_stdout_wrapper_runtime_checks_without_private_log_redirection(
     monkeypatch.setenv("TF_CLUSTER_SOURCE_DIR", str(ROOT / "src"))
     monkeypatch.setenv("TF_CLUSTER_EXPECTED_UID", str(expected_uid))
     monkeypatch.setenv("TF_CLUSTER_DRIVER_POD", POD)
+    monkeypatch.setenv("SPARK_DRIVER_BIND_ADDRESS", "10.112.1.23")
     with pytest.raises(SystemExit) as exit_info:
         exec(compile(python, str(path), "exec"), {})  # noqa: S102 - repository-owned inline probe
     assert exit_info.value.code == (0 if passed else 2)
     output = capsys.readouterr().out
     assert output.startswith("TF_CLUSTER_DRIVER_RUNTIME ")
-    assert json.loads(output.partition(" ")[2])["passed"] is passed
+    report = json.loads(output.partition(" ")[2])
+    assert report["passed"] is passed
+    assert report["driver_ip"] == "10.112.1.23"

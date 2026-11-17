@@ -32,6 +32,65 @@ PERMISSIONS = (
     ("services", None, "create"),
     ("configmaps", None, "create"),
 )
+EVENT_LOG_INIT_NAME = "trajfoundry-event-log-init"
+EVENT_LOG_INIT_SCRIPT = (
+    'umask 077\nmkdir -p -- "$1"\n'
+    '[[ -d "$1" && ! -L "$1" && -O "$1" && -w "$1" && -x "$1" ]]\n'
+)
+
+
+def prepare_event_log(args, driver_spec, container):
+    """Create a per-run PVC subPath as the Driver UID before it is mounted.
+
+    The Worker only creates private /tmp files. Without this init container,
+    kubelet creates the missing event-log subPath as root and Spark cannot
+    write there. The init container mounts the existing /share subPath only.
+    """
+    mounts = container.get("volumeMounts", [])
+    event_mount = next(
+        (item for item in mounts if item.get("mountPath") == submit.EVENT_LOG_DIR),
+        None,
+    )
+    if event_mount is None:
+        return
+    share_mount = next(
+        (
+            item
+            for item in mounts
+            if item.get("name") == event_mount.get("name")
+            and item.get("mountPath") == "/share"
+            and item.get("subPath") == "dsj"
+        ),
+        None,
+    )
+    if share_mount is None:
+        return
+    try:
+        relative = args.control_dir.relative_to(Path("/share")) / "eventLog"
+    except ValueError:
+        return
+    if event_mount.get("subPath") != str(Path("dsj") / relative):
+        return
+    init_containers = driver_spec.setdefault("initContainers", [])
+    if any(item.get("name") == EVENT_LOG_INIT_NAME for item in init_containers):
+        raise Error("reserved_event_log_init_container")
+    resources = {"cpu": "10m", "memory": "32Mi"}
+    init_containers.append(
+        {
+            "name": EVENT_LOG_INIT_NAME,
+            "image": args.image,
+            "command": [
+                "/bin/bash",
+                "-ceu",
+                EVENT_LOG_INIT_SCRIPT,
+                EVENT_LOG_INIT_NAME,
+                str(args.control_dir / "eventLog"),
+            ],
+            "securityContext": dict(container["securityContext"]),
+            "resources": {"requests": dict(resources), "limits": dict(resources)},
+            "volumeMounts": [dict(share_mount)],
+        }
+    )
 
 
 def parser():
@@ -53,7 +112,8 @@ def make_plan(options):
         if getattr(options, name) is not None:
             setattr(args, name, getattr(options, name))
     plan = submit.make_plan(args)
-    driver = plan["driver_template"]["spec"]["containers"]
+    driver_spec = plan["driver_template"]["spec"]
+    driver = driver_spec["containers"]
     container = next(item for item in driver if item["name"] == args.container_name)
     container["command"] = [
         "/bin/bash",
@@ -62,6 +122,7 @@ def make_plan(options):
     container["env"] = [
         item for item in container["env"] if item["name"] != "TF_CLUSTER_LOG_PATH"
     ]
+    prepare_event_log(args, driver_spec, container)
     command = plan["command"]
     index = command.index(
         "local://" + str(args.project_root / "spark/tokenplan_normalize.py")
