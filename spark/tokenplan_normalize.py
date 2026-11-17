@@ -39,6 +39,9 @@ def argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--endpoint-url")
     parser.add_argument("--region-name", default="us-east-1")
+    parser.add_argument("--output-owner")
+    parser.add_argument("--resume-owned-output", action="store_true")
+    parser.add_argument("--input-inventory-sha256")
     parser.add_argument(
         "--input-credentials-file",
         help="absolute secure JSON file path readable by each Executor; values stay out of Spark config",
@@ -57,7 +60,7 @@ def argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicit retry mode: reuse/replace objects in an existing S3 output prefix",
     )
-    parser.add_argument("--input-format", choices=("tokenplan",), default="tokenplan")
+    parser.add_argument("--input-format", choices=("tokenplan", "boyue", "deepinfra"), default="tokenplan")
     parser.add_argument("--shuffle-partitions", type=int)
     parser.add_argument("--read-parallelism", type=int)
     parser.add_argument(
@@ -110,6 +113,9 @@ def build_config(argv=None) -> SparkNormalizeConfig:
         input_uri=args.input_uri,
         output_uri=args.output_uri,
         input_format=args.input_format,
+        output_owner=args.output_owner,
+        resume_owned_output=args.resume_owned_output,
+        input_inventory_sha256=args.input_inventory_sha256,
         endpoint_url=args.endpoint_url,
         region_name=args.region_name,
         prefix_shards=tuple(args.prefix_shard or ()),

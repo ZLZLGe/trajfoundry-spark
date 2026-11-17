@@ -236,6 +236,27 @@ def validate_run(args, plan: dict) -> dict:
     status = pod.get("status", {})
     containers = status.get("containerStatuses", [])
     runtime, job = read_reports(args.control_dir / "driver.log")
+    zero_trajectories_accounted = (
+        getattr(args, "input_format", None) in {"boyue", "deepinfra"}
+        and all(
+            type(job.get(name)) is int and job[name] >= 0
+            for name in (
+                "input_files",
+                "trajectories",
+                "accepted",
+                "quarantined_trajectories",
+                "quarantined_records",
+                "skipped_inputs",
+                "verified_trajectory_objects",
+            )
+        )
+        and job["trajectories"]
+        == job["accepted"]
+        == job["quarantined_trajectories"]
+        == job["verified_trajectory_objects"]
+        == 0
+        and job["input_files"] == job["quarantined_records"] + job["skipped_inputs"]
+    )
     checks = {
         "driver_identity": metadata.get("name") == plan["driver_pod"]
         and metadata.get("namespace") == args.namespace
@@ -260,7 +281,7 @@ def validate_run(args, plan: dict) -> dict:
         and type(job.get("input_files")) is int
         and job["input_files"] > 0
         and type(job.get("trajectories")) is int
-        and job["trajectories"] > 0,
+        and (job["trajectories"] > 0 or zero_trajectories_accounted),
     }
     # Do not touch artifacts/credentials for the wrong or an unsuccessful run.
     if all(checks.values()):

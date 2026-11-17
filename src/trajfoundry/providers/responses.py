@@ -2176,6 +2176,7 @@ def parse_responses_capture(
     *,
     source_path: str,
     source_sha256: str,
+    archive_without_http_status: bool = False,
 ) -> Snapshot:
     """Parse one freerouter ``/v1/responses`` capture.
 
@@ -2220,7 +2221,9 @@ def parse_responses_capture(
         and status_code_raw > 0
         else None
     )
-    transport_error = status_code is None
+    transport_error = status_code is None and not (
+        archive_without_http_status and status_code_raw is None
+    )
     if transport_error:
         _issue(
             issues,
@@ -2228,7 +2231,7 @@ def parse_responses_capture(
             "status_code",
             "capture has no valid HTTP status code",
         )
-    elif not 200 <= status_code < 300:
+    elif status_code is not None and not 200 <= status_code < 300:
         _issue(
             issues,
             "openai_api_error",

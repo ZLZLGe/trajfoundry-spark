@@ -1,4 +1,4 @@
-"""Date-based TokenPlan Cluster entrypoint; plans unless --execute is explicit."""
+"""Date-based Cluster entrypoint; plans unless --execute is explicit."""
 
 from __future__ import annotations
 
@@ -98,6 +98,12 @@ def make_schedule(config_path, biz_date):
     arg_parser.allow_abbrev = False
     arg_parser.error = invalid_arguments
     args = arg_parser.parse_args(command)
+    if args.input_format == "boyue":
+        # Boyue archives use YYYY-MM-DD directly, while normalized output and
+        # the other supported sources use dt=YYYY-MM-DD. Keep both submit
+        # entrypoints and the Driver's storage checks on the same input URI.
+        args.input_uri = config["input_base_uri"].rstrip("/") + f"/{biz_date}/"
+        command[command.index("--input-uri") + 1] = args.input_uri
     plan = submit.make_plan(args)
     if args.input_credentials_file is None or args.output_credentials_file is None:
         raise ScheduledError("explicit_credentials_paths_required")

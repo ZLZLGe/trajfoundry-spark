@@ -30,7 +30,7 @@ from ..quality import is_strict_sample, validate_derived_fields
 from ..s3 import S3Location
 from .paths import validate_flat_output_name, validate_output_name
 
-InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
+InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"]
 
 
 @dataclass(frozen=True, slots=True)

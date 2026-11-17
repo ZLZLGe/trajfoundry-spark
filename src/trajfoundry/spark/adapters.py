@@ -9,13 +9,35 @@ from typing import Any, Literal
 from ..identity import aggregation_scope, normalize_session_id
 from ..io import decode_capture
 from ..json_codec import dumps as json_dumps
+from ..models import AuditIssue, Severity, Snapshot
 from ..pipeline import parse_capture
+from ..sources.boyue import adapt_boyue_envelope, exclude_nontrajectory
 from ..sources.deepinfra import adapt_deepinfra_envelope
 from ..sources.sxf import adapt_sxf_envelope
 from ..sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
 from .records import ParsedSnapshotRow
 
-InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
+InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"]
+
+
+class SnapshotUnicodeError(ValueError):
+    """A capture produced Unicode surrogate code points that JSON cannot encode."""
+
+
+def _serialize_snapshot(snapshot: Snapshot) -> bytes:
+    value = snapshot.model_dump(mode="json")
+    try:
+        return json_dumps(value, sort_keys=True)
+    except TypeError as error:
+        # orjson.JSONEncodeError aliases TypeError. Match only its known
+        # surrogate error at this boundary; programming faults must propagate.
+        if str(error) != "str is not valid UTF-8: surrogates not allowed":
+            raise
+    except UnicodeEncodeError as error:
+        # The arbitrary-precision integer fallback uses Python's UTF-8 encoder.
+        if error.encoding != "utf-8" or error.reason != "surrogates not allowed":
+            raise
+    raise SnapshotUnicodeError("invalid Unicode in snapshot") from None
 
 
 def _scope_fields(snapshot: Any) -> tuple[str, str]:
@@ -48,6 +70,7 @@ def parse_payload(
     captured_at = ""
     response_is_normalized_final = False
     multimodal_file_mapping: list[Any] = []
+    boyue = None
 
     if input_format == "tokenplan":
         adapted = adapt_tokenplan_envelope(capture)
@@ -66,8 +89,15 @@ def parse_payload(
             request_path = outer_request.get("path")
             if isinstance(request_path, str):
                 endpoint = request_path.split("?", 1)[0].rstrip("/")
+        exclude_nontrajectory(endpoint)
         capture = adapt_deepinfra_envelope(capture)
         source_name = "deepinfra"
+    elif input_format == "boyue":
+        boyue = adapt_boyue_envelope(capture)
+        capture = boyue.capture
+        endpoint = capture["path"]
+        source_name = "boyue"
+        response_is_normalized_final = boyue.response_is_normalized_final
 
     captured_value = capture.get("captured_at")
     if isinstance(captured_value, str):
@@ -80,6 +110,29 @@ def parse_payload(
         response_is_normalized_final=response_is_normalized_final,
         multimodal_file_mapping=multimodal_file_mapping,
     )
+    if boyue is not None:
+        for code in boyue.issues:
+            snapshot.issues.append(
+                AuditIssue(
+                    code=code,
+                    stage="parsing",
+                    severity=Severity.WARNING,
+                    path="/response_body",
+                    detail="source archive evidence: " + code,
+                )
+            )
+        if boyue.incomplete:
+            snapshot.wire_complete = False
+            snapshot.outcome = "truncated"
+            snapshot.issues.append(
+                AuditIssue(
+                    code="boyue_incomplete_capture",
+                    stage="parsing",
+                    severity=Severity.ERROR,
+                    path="/response_body",
+                    detail="archive does not preserve a complete provider response",
+                )
+            )
     scope_kind, scope_id = _scope_fields(snapshot)
     return ParsedSnapshotRow(
         source_ref=source_ref,
@@ -91,8 +144,8 @@ def parse_payload(
         thread_id=snapshot.thread_id or "",
         captured_at=captured_at,
         endpoint=endpoint,
-        snapshot_json=json_dumps(snapshot.model_dump(mode="json"), sort_keys=True),
+        snapshot_json=_serialize_snapshot(snapshot),
     )
 
 
-__all__ = ["ParsedSnapshotRow", "TokenPlanError", "parse_payload"]
+__all__ = ["ParsedSnapshotRow", "SnapshotUnicodeError", "TokenPlanError", "parse_payload"]

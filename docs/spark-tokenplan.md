@@ -311,7 +311,7 @@ DolphinScheduler Worker 的 `/share` 视图可能不同于 Jupyter/Kubernetes，
 s3://<bucket>/<input-prefix>/dt=YYYY-MM-DD/<user>/<session-or-placeholder>/req_*.json
 ```
 
-Executor 分片读取前缀，过滤 `req_*.json`，逐对象调用现有 TokenPlan 适配器和 provider parser。解析记录在 Spark Shuffle 中按 `(scope_kind, scope_id)` 分区，随后在分区内排序并逐个 scope 构建轨迹。最终直接写入现有 flat v4 JSONL 输出；以下 S3 前缀也可替换为独占共享目录，文件布局不变：
+Executor 分片读取前缀，过滤 `req_*.json`，逐对象调用现有 TokenPlan 适配器和 provider parser。解析记录在 Spark Shuffle 中按 `(scope_kind, scope_id)` 分区，随后在分区内排序并逐个 scope 构建轨迹。最终直接写入现有 flat v4 JSONL 输出；以下 S3 前缀也可替换为独占共享目录，轨迹、lineage 和 manifest 的布局相同：
 
 ```text
 s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=YYYY-MM-DD/
@@ -320,15 +320,15 @@ s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=YYYY-MM-DD/
 ├── lineage.jsonl
 ├── manifest.json
 └── diagnostics/
-    ├── input_diagnostics.ndjson
     ├── ._objects_part_<run_id>_<partition>.ndjson
-    ├── ._lineage_part_<run_id>_<partition>.ndjson
-    └── ._diagnostic_part_<run_id>_<partition>.ndjson
+    └── ._lineage_part_<run_id>_<partition>.ndjson
 ```
 
 轨迹正文、`lineage.jsonl` 和最终 `manifest.json` 直接位于日期目录下，便于下游
-按既有路径读取。运行中的分片回执与输入诊断统一位于 `diagnostics/` 子目录，
-不会与正文文件混在一起；诊断分片合并为 `diagnostics/input_diagnostics.ndjson`。
+按既有路径读取。完成校验所需的对象清单和 lineage 分片回执位于 `diagnostics/`
+子目录，按辅助文件保留策略处理。S3 不上传输入诊断明细，也不上传诊断分片；
+解析失败、隔离、排除数量及原因计数仍汇总到 manifest，运行日志继续保留。
+本地文件系统输出仍保存 `diagnostics/input_diagnostics.ndjson`，供调试使用。
 失败运行的未发布文件和运行标记按原约定保留以便排查，不能将其当作成功结果；
 已成功发布的 manifest 只登记正文和 lineage，不把诊断辅助文件加入业务文件计数。
 
@@ -360,8 +360,10 @@ s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=YYYY-MM-DD/
 
 该模式**不保存外部 Snapshot Parquet，也不创建长期 `spark-work` 目录**。Spark
 仍会使用 Executor 本地 Shuffle/spill 和发布元数据临时 SQLite。manifest 最后
-发布；已知输入失败及不可构建输入写安全 `diagnostics/input_diagnostics.ndjson` 侧车，摘要返回路径/哈希，它不
-是轨迹也不加入 v4 files。内部程序异常必须导致失败，不能伪装成坏输入跳过。
+发布；已知输入失败及不可构建输入保留计数。本地文件系统输出另写安全的
+`diagnostics/input_diagnostics.ndjson` 侧车，摘要返回路径/哈希；S3 摘要的
+`diagnostics` 为 `null`。侧车不是轨迹，也不加入 v4 files。
+内部程序异常必须导致失败，不能伪装成坏输入跳过。
 
 输出前缀或目录非空时在任何数据写入前拒绝运行，不覆盖旧 manifest 引用的数据。
 同一输出目的地必须独占；S3 空前缀检查不是分布式锁，共享目录还使用本次运行的

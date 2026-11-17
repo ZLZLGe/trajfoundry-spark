@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import platform
+import shutil
 import socket
 import sys
 import uuid
@@ -48,6 +49,7 @@ def check_runtime(
     source_dir: str,
     expected_python: str,
     expected_architecture: str,
+    require_pyarrow: bool = False,
 ) -> dict[str, Any]:
     info: dict[str, Any] = {
         "role": role,
@@ -64,12 +66,13 @@ def check_runtime(
         == normalized_architecture(expected_architecture),
         "source_dir": source_dir,
         "source_visible": Path(source_dir).is_dir(),
+        "scratch_free_bytes": shutil.disk_usage("/tmp").free,
         "dependencies": {},
         "project_import_ok": False,
     }
     if info["source_visible"]:
         sys.path.insert(0, source_dir)
-    for name in DEPENDENCIES:
+    for name in (*DEPENDENCIES, *(("pyarrow",) if require_pyarrow else ())):
         try:
             module = importlib.import_module(name)
             version = str(getattr(module, "__version__", "unknown"))
@@ -100,7 +103,9 @@ def check_runtime(
     return info
 
 
-def executor_probe(rows, *, source_dir, expected_python, expected_architecture):
+def executor_probe(
+    rows, *, source_dir, expected_python, expected_architecture, require_pyarrow=False
+):
     from pyspark import BarrierTaskContext
 
     context = BarrierTaskContext.get()
@@ -110,6 +115,7 @@ def executor_probe(rows, *, source_dir, expected_python, expected_architecture):
         source_dir=source_dir,
         expected_python=expected_python,
         expected_architecture=expected_architecture,
+        require_pyarrow=require_pyarrow,
     )
     result["partition"] = context.partitionId()
     result["sum"] = sum(rows)
@@ -152,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--executor-python", required=True)
     parser.add_argument("--driver-architecture", default="x86_64")
     parser.add_argument("--executor-architecture", default="aarch64")
+    parser.add_argument("--require-pyarrow", action="store_true")
     args = parser.parse_args(argv)
     run_id = uuid.uuid4().hex[:16]
     report: dict[str, Any] = {
@@ -169,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             source_dir=args.source_dir,
             expected_python=args.driver_python,
             expected_architecture=args.driver_architecture,
+            require_pyarrow=args.require_pyarrow,
         )
         emit({"kind": "driver_runtime", "run_id": run_id, "driver": report["driver"]})
         if not report["driver"]["ready"]:
@@ -214,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_dir = args.source_dir
                 executor_python = args.executor_python
                 executor_architecture = args.executor_architecture
+                require_pyarrow = args.require_pyarrow
                 report["executors"] = (
                     sc.parallelize(range(100), 2)
                     .barrier()
@@ -223,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                             source_dir=source_dir,
                             expected_python=executor_python,
                             expected_architecture=executor_architecture,
+                            require_pyarrow=require_pyarrow,
                         )
                     )
                     .collect()

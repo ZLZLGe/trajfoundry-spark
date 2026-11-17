@@ -1581,6 +1581,7 @@ def parse_anthropic_capture(
     source_path: str,
     source_sha256: str,
     response_is_normalized_final: bool = False,
+    archive_without_http_status: bool = False,
 ) -> Snapshot:
     """Parse one freerouter Anthropic capture.
 
@@ -1665,13 +1666,15 @@ def parse_anthropic_capture(
             *identity_issues,
         ]
         body = capture.get("response_body")
-        if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
+        if not (archive_without_http_status and status is None) and (
+            not isinstance(status, int) or isinstance(status, bool) or status <= 0
+        ):
             outcome = "transport_error"
             issues.append(
                 _issue("missing_http_status", "capture has no valid HTTP status code")
             )
             wire_complete = False
-        elif not 200 <= status < 300:
+        elif status is not None and not 200 <= status < 300:
             outcome = "api_error"
             issues.append(
                 _issue("anthropic_api_error", f"Anthropic returned HTTP {status}")
@@ -1714,7 +1717,9 @@ def parse_anthropic_capture(
     history = _parse_history(request, context)
     tools = _parse_tools(request, context.issues)
 
-    if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
+    if not (archive_without_http_status and status is None) and (
+        not isinstance(status, int) or isinstance(status, bool) or status <= 0
+    ):
         context.issues.append(
             _issue("missing_http_status", "capture has no valid HTTP status code")
         )
@@ -1722,7 +1727,7 @@ def parse_anthropic_capture(
         response_model = ""
         outcome = "transport_error"
         wire_complete = False
-    elif not 200 <= status < 300:
+    elif status is not None and not 200 <= status < 300:
         body = capture.get("response_body")
         error: Any = None
         if isinstance(body, dict):

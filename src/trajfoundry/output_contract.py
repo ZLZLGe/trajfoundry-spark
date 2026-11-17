@@ -640,10 +640,11 @@ def _validate_node(
         "tokenplan",
         "sxf",
         "deepinfra",
+        "boyue",
     }:
         _fail(
             f"{path}/metadata/source_name",
-            "must equal 'freerouter', 'tokenplan', 'sxf', or 'deepinfra'",
+            "must equal 'freerouter', 'tokenplan', 'sxf', 'deepinfra', or 'boyue'",
         )
     _integer(metadata["line_no"], f"{path}/metadata/line_no")
     for field in ("created_at", "model", "user_id", "session_id"):
@@ -689,6 +690,7 @@ def _validate_node(
         "tokenplan": ("api-router", "token-plan"),
         "sxf": ("traj-cooperate", "SXF"),
         "deepinfra": ("api-router", "deep-infra"),
+        "boyue": ("api-router", "boyue-rich"),
     }
     expected_type, expected_specific = expected_sources[metadata["source_name"]]
     if metadata["source_type"] != expected_type:

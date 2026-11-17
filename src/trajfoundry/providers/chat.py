@@ -726,7 +726,7 @@ def _decode_response_body(
 def _parse_response(
     body: Any,
     *,
-    status_code: int,
+    status_code: int | None,
     context: _ParseContext,
 ) -> tuple[list[Message], str, str, bool]:
     issue_start = len(context.issues)
@@ -843,6 +843,7 @@ def parse_chat_capture(
     source_path: str,
     source_sha256: str,
     response_is_normalized_final: bool = False,
+    archive_without_http_status: bool = False,
 ) -> Snapshot:
     """Parse one OpenAI-compatible ``/v1/chat/completions`` capture.
 
@@ -949,7 +950,9 @@ def parse_chat_capture(
     status = capture.get("status_code")
     response: list[Message] = []
     response_model = ""
-    if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
+    if not (archive_without_http_status and status is None) and (
+        not isinstance(status, int) or isinstance(status, bool) or status <= 0
+    ):
         _issue(
             context.issues,
             "missing_http_status",
@@ -958,7 +961,7 @@ def parse_chat_capture(
         )
         outcome = "transport_error"
         wire_complete = False
-    elif not 200 <= status < 300:
+    elif status is not None and not 200 <= status < 300:
         _issue(
             context.issues,
             "openai_api_error",

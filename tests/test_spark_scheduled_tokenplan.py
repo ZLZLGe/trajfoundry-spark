@@ -132,6 +132,32 @@ def test_plan_reuses_source_validation_without_auth_network_or_directories(
     assert "credentials" not in report and "command" not in report
 
 
+@pytest.mark.parametrize("input_format", ["tokenplan", "boyue", "deepinfra"])
+@pytest.mark.parametrize("joined_flag", [False, True], ids=["split", "equals"])
+def test_source_date_layout_is_kept_in_args_command_and_report(
+    config, input_format, joined_flag
+):
+    value = json.loads(config.read_text())
+    value["input_base_uri"] = f"s3://input/{input_format}/masked-raw/v002/"
+    value["output_base_uri"] = f"s3://output/{input_format}/normalized/v001/"
+    value["submit_args"].extend(
+        [f"--input-format={input_format}"]
+        if joined_flag
+        else ["--input-format", input_format]
+    )
+    config.write_text(json.dumps(value))
+    before = set(config.parent.iterdir())
+    args, _, command, public = scheduled.make_schedule(config, "2026-09-15")
+    partition = "2026-09-15" if input_format == "boyue" else "dt=2026-09-15"
+    expected_input = value["input_base_uri"] + partition + "/"
+    expected_output = value["output_base_uri"] + "dt=2026-09-15/"
+    assert args.input_uri == public["input_uri"] == expected_input
+    assert command[command.index("--input-uri") + 1] == expected_input
+    assert args.output_uri == public["output_uri"] == expected_output
+    assert command[command.index("--output-uri") + 1] == expected_output
+    assert set(config.parent.iterdir()) == before
+
+
 @pytest.mark.parametrize(
     "value",
     [

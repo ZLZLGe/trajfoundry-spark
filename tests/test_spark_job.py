@@ -90,6 +90,15 @@ class LocalObjectStore:
         }
 
 
+class NoDiagnosticObjectStore(LocalObjectStore):
+    """Reject diagnostic uploads even if a job would later delete the object."""
+
+    def put_object(self, *, Bucket, Key, Body, **kwargs):
+        assert "/._diagnostic_part_" not in Key
+        assert not Key.endswith("/input_diagnostics.ndjson")
+        return super().put_object(Bucket=Bucket, Key=Key, Body=Body, **kwargs)
+
+
 class CorruptObjectStore(LocalObjectStore):
     """Keep original HEAD metadata while corrupting a selected GET body."""
 
@@ -144,6 +153,68 @@ def test_invalid_non_object_input_is_an_explicit_failure():
         job._parse_partition([("req.json", b"[]", "")], input_format="tokenplan")
     )
     assert rows[0][0] == "error"
+
+
+@pytest.mark.parametrize("retain_s3_auxiliary", [False, True])
+def test_s3_partition_counts_errors_without_serializing_diagnostic_details(
+    tmp_path, monkeypatch, retain_s3_auxiliary
+):
+    original_dumps = job.dumps
+
+    def no_diagnostic_serialization(value, **kwargs):
+        assert "source_ref" not in value
+        return original_dumps(value, **kwargs)
+
+    monkeypatch.setattr(job, "dumps", no_diagnostic_serialization)
+    artifacts = [
+        ("counts", {"input_files": 4, "skipped_inputs": 1}),
+        ("diagnostic", {"source_ref": "invalid.json", "reason": "parse_failure"}),
+        (
+            "record",
+            {
+                "source_ref": "failed.json",
+                "normalization_audit": {
+                    "tag": "quarantined",
+                    "reason_codes": ["snapshot_failed"],
+                },
+            },
+        ),
+        (
+            "record",
+            {
+                "source_ref": "excluded.json",
+                "normalization_audit": {
+                    "tag": "excluded",
+                    "reason_codes": ["non_trajectory_operation"],
+                },
+            },
+        ),
+        ("trajectory", job.build_scope([_snapshot()])[0]),
+    ]
+    result = next(
+        job._publish_partition(
+            0,
+            iter(artifacts),
+            output_uri="s3://fake/out/",
+            endpoint_url=None,
+            region_name="unused",
+            client_factory=partial(NoDiagnosticObjectStore, str(tmp_path)),
+            retain_s3_auxiliary=retain_s3_auxiliary,
+            run_id="a" * 32,
+        )
+    )
+    assert result["input_files"] == 4
+    assert result["skipped_inputs"] == 1
+    assert result["quarantined_records"] == 2
+    assert result["excluded_records"] == 1
+    assert result["reason_counts"] == {
+        "parse_failure": 1,
+        "snapshot_failed": 1,
+        "non_trajectory_operation": 1,
+    }
+    assert result["object_count"] == 1
+    assert result["lineage_part"] and result["objects_part"]
+    assert "diagnostic_part" not in result
 
 
 def test_publish_consumes_trajectories_incrementally_and_sorts_only_lineage(tmp_path):
@@ -457,7 +528,7 @@ def test_real_spark_local_two_end_to_end_and_effective_submit_settings(
         config,
         spark=local_spark,
         source_reader=partial(synthetic_reader, records=records),
-        client_factory=partial(LocalObjectStore, str(tmp_path)),
+        client_factory=partial(NoDiagnosticObjectStore, str(tmp_path)),
     )
     assert result["input_files"] == 2
     assert result["parse_failures"] == 1
@@ -470,15 +541,17 @@ def test_real_spark_local_two_end_to_end_and_effective_submit_settings(
     assert effective.get("spark.executor.memory") == "512m"
     output = tmp_path / "fake" / "out"
     assert validate_output(output).valid
-    assert result["diagnostics"]["path"] == "diagnostics/input_diagnostics.ndjson"
+    assert result["diagnostics"] is None
     assert {path.name for path in output.iterdir()} == {
         "session-1_sub_0.jsonl",
         "manifest.json",
         "lineage.jsonl",
         "diagnostics",
     }
-    diagnostic = json.loads((output / result["diagnostics"]["path"]).read_bytes())
-    assert diagnostic["source_ref"] == "bob/req_invalid.json"
+    assert list((output / "diagnostics").iterdir()) == []
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    assert manifest["counts"]["skipped_inputs"] == 1
+    assert manifest["counts"]["skip_reason_counts"] == {"parse_failure": 1}
     assert not list(output.rglob("._*"))
     before = {
         path.relative_to(output): path.read_bytes()
@@ -523,9 +596,44 @@ def test_real_spark_driver_limit_prevents_manifest(local_spark, tmp_path):
     assert not (tmp_path / "fake" / "out" / "manifest.json").exists()
 
 
-@pytest.mark.parametrize(
-    "corrupt_kind", ["trajectory", "lineage.jsonl", "input_diagnostics.ndjson"]
-)
+def test_real_spark_boyue_counts_and_contract(local_spark, tmp_path):
+    from .test_spark_lakehouse_sources import boyue_record
+
+    valid = boyue_record()
+    excluded = boyue_record()
+    excluded["metadata"]["other"]["request_path"] = "/v1/embeddings"
+    records = [
+        ("00/a/raw.json", json.dumps(valid).encode()),
+        ("00/b/raw.json", json.dumps(excluded).encode()),
+        ("00/c/raw.json", b"broken-json"),
+    ]
+    config = SparkNormalizeConfig(
+        "s3://fake/in/", "s3://fake/out/", input_format="boyue", prefix_shards=("00/",)
+    )
+    result = job.run_spark_job(
+        config,
+        spark=local_spark,
+        source_reader=partial(synthetic_reader, records=records),
+        client_factory=partial(NoDiagnosticObjectStore, str(tmp_path)),
+    )
+    assert result["input_files"] == 3
+    assert result["parse_failures"] == 1
+    assert result["trajectories"] == 1
+    assert result["diagnostics"] is None
+    output = tmp_path / "fake/out"
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    assert manifest["counts"]["skip_reason_counts"] == {
+        "parse_failure": 1,
+        "non_trajectory_endpoint": 1,
+    }
+    assert manifest["record_count"] == 1
+    assert manifest["parse_failure_count"] == 1
+    assert validate_output(output).valid
+    trajectory = json.loads((output / "real-session_sub_0.jsonl").read_bytes())
+    assert trajectory["total_tokens"] > 0
+
+
+@pytest.mark.parametrize("corrupt_kind", ["trajectory", "lineage.jsonl"])
 def test_s3_verification_failure_prevents_success_manifest(
     local_spark, tmp_path, corrupt_kind
 ):

@@ -39,10 +39,12 @@ probe_service_account="${TF_SPARK_EXECUTOR_SERVICE_ACCOUNT:-}"
 probe_driver_pod="${TF_SPARK_DRIVER_POD_NAME:-}"
 probe_driver_port="${TF_SPARK_DRIVER_PORT:-}"
 probe_block_manager_port="${TF_SPARK_BLOCK_MANAGER_PORT:-}"
+probe_require_pyarrow=false
 
 while (($#)); do
     case "$1" in
         --help|-h) usage; exit 0 ;;
+        --require-pyarrow) probe_require_pyarrow=true; shift ;;
         --driver-python|--executor-python|--executor-pod-template|--executor-queue|--master|--namespace|--driver-host|--ca-cert|--spark-submit|--project-root|--executor-image|--oauth-token-file|--executor-service-account|--driver-pod-name|--driver-port|--block-manager-port)
             (($# >= 2)) || fail "missing value for $1"
             [[ -n "$2" ]] || fail "empty value for $1"
@@ -133,6 +135,8 @@ probe_command+=(
     --driver-python "$probe_driver_python"
     --executor-python "$probe_executor_python"
 )
+
+[[ "$probe_require_pyarrow" == false ]] || probe_command+=(--require-pyarrow)
 
 # Spark/Fabric8 inherits platform authentication. Never inspect tokens or dump
 # the complete configuration. These unsets affect only this child process.

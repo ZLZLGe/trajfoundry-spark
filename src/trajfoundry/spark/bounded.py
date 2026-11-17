@@ -281,6 +281,7 @@ def _trajectory_from_leaf(
         "tokenplan": ("api-router", "token-plan"),
         "sxf": ("traj-cooperate", "SXF"),
         "deepinfra": ("api-router", "deep-infra"),
+        "boyue": ("api-router", "boyue-rich"),
     }[leaf.source_name]
     if summary.user_id_changed:
         issues = _merged_issues(

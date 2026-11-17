@@ -63,7 +63,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-10-14.2"
+NORMALIZER_REVISION = "2026-11-05.spark.2"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -270,7 +270,7 @@ def parse_capture(
     *,
     source_path: str,
     source_sha256: str,
-    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter",
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter",
     response_is_normalized_final: bool = False,
     multimodal_file_mapping: Sequence[MediaMapping] | None = None,
 ) -> Snapshot:
@@ -283,6 +283,7 @@ def parse_capture(
     arguments = {
         "source_path": source_path,
         "source_sha256": source_sha256,
+        "archive_without_http_status": source_name == "boyue",
     }
     if endpoint in {"/v1/responses", "/responses"}:
         snapshot = parse_responses_capture(capture, **arguments)
@@ -728,6 +729,7 @@ def _trajectory_from_leaf(
         "tokenplan": ("api-router", "token-plan"),
         "sxf": ("traj-cooperate", "SXF"),
         "deepinfra": ("api-router", "deep-infra"),
+        "boyue": ("api-router", "boyue-rich"),
     }[leaf.source_name]
     contributor_user_ids = {
         snapshot.user_id for snapshot in contributor_list if snapshot.user_id

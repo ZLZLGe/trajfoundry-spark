@@ -109,6 +109,22 @@ def test_default_plan_no_network_secret_reads_or_directories(
     assert set(config.parent.iterdir()) == before
 
 
+def test_boyue_worker_plan_keeps_raw_date_in_validating_driver(config):
+    value = json.loads(config.read_text())
+    value["input_base_uri"] = "s3://input/boyue-rich/masked-raw/v002/"
+    value["output_base_uri"] = "s3://output/boyue-rich/normalized/v001/"
+    value["submit_args"].extend(["--input-format", "boyue"])
+    config.write_text(json.dumps(value))
+    options = scheduler.parser().parse_args(cli(config))
+    args, plan, public = scheduler.make_plan(options)
+    expected = "s3://input/boyue-rich/masked-raw/v002/2026-09-15/"
+    assert args.input_uri == public["input_uri"] == expected
+    assert public["output_uri"] == "s3://output/boyue-rich/normalized/v001/dt=2026-09-15/"
+    assert plan["command"][plan["command"].index("--input-uri") + 1] == expected
+    assert plan["command"][plan["command"].index("--input-format") + 1] == "boyue"
+    assert "local://" + str(ROOT / "spark/scheduler_cluster_job.py") in plan["command"]
+
+
 def test_worker_overrides_and_driver_command_keep_business_routing(config):
     value = json.loads(config.read_text())
     source = Path(

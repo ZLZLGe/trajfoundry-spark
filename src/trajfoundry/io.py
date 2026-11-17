@@ -136,7 +136,7 @@ def read_capture_bytes(path: Path) -> tuple[bytes, str]:
 def decode_capture(
     payload: bytes,
     *,
-    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter",
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter",
 ) -> dict[str, Any]:
     """Decode one capture while discarding sensitive headers immediately.
 
@@ -161,7 +161,7 @@ def decode_capture(
     elif input_format == "sxf":
         # SXF has its own envelope adapter, which also sanitizes headers.
         pass
-    elif input_format not in {"tokenplan", "deepinfra"}:
+    elif input_format not in {"tokenplan", "deepinfra", "boyue"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
     return capture
 

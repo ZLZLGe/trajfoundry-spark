@@ -119,6 +119,11 @@ def parser() -> argparse.ArgumentParser:
         help="discover immediate user prefixes under the input URI on one Spark partition",
     )
     result.add_argument("--max-prefix-shards", type=positive, default=1_000_000)
+    result.add_argument(
+        "--input-format",
+        choices=("tokenplan", "boyue", "deepinfra"),
+        default="tokenplan",
+    )
     result.add_argument("--endpoint-url", required=True)
     result.add_argument("--region-name", default="us-east-1")
     result.add_argument("--input-credentials-file", type=absolute)
@@ -224,7 +229,9 @@ def prepare_template(args, path: Path, *, driver: bool, pod_name: str) -> dict:
         try:
             value = json.loads(text)
         except json.JSONDecodeError as error:
-            raise ValueError("template must be valid JSON (or use .yaml/.yml)") from error
+            raise ValueError(
+                "template must be valid JSON (or use .yaml/.yml)"
+            ) from error
     if not isinstance(value, dict):
         raise TypeError("template must be a Kubernetes Pod object")
     if value.get("kind") != "Pod":
@@ -302,9 +309,7 @@ def prepare_template(args, path: Path, *, driver: bool, pod_name: str) -> dict:
                 # The `/share` mount is backed by the PVC's `dsj` subPath.
                 # Bind this run's event directory rather than the unwritable
                 # `dsj` root itself.
-                event_subpath = str(
-                    Path(event_subpath) / relative_control / "eventLog"
-                )
+                event_subpath = str(Path(event_subpath) / relative_control / "eventLog")
             event_log_mount["subPath"] = event_subpath
         mounts.append(event_log_mount)
     shared_volumes = {
@@ -448,6 +453,7 @@ def make_plan(args, *, run_id: str | None = None) -> dict:
     SparkNormalizeConfig(
         input_uri=args.input_uri,
         output_uri=output_uri,
+        input_format=args.input_format,
         prefix_shards=tuple(args.prefix_shard or ()),
         auto_prefix_shards=args.auto_prefix_shards,
         max_prefix_shards=args.max_prefix_shards,
@@ -590,6 +596,7 @@ def make_plan(args, *, run_id: str | None = None) -> dict:
             "2048",
         ]
     )
+    command.extend(["--input-format", args.input_format])
     command.extend(args.job_arg)
     return {
         "run_id": run_id,

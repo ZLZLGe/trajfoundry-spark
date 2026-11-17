@@ -35,7 +35,7 @@ from ..s3 import S3Location, create_s3_client
 from ..sources.deepinfra import DeepInfraError
 from ..sources.sxf import SXFError
 from ..sources.tokenplan import TokenPlanError
-from .adapters import parse_payload
+from .adapters import SnapshotUnicodeError, parse_payload
 from .build import build_scope
 from .config import SparkNormalizeConfig, validate_prefix_shards
 from .manifest import DiskManifestAccumulator
@@ -47,6 +47,7 @@ from .output import (
     serialize_trajectory,
 )
 from .paths import DIAGNOSTICS_DIRECTORY
+from .sort import repartition_and_sort
 from .source import (
     discover_prefix_shards,
     iter_shard_payloads,
@@ -226,6 +227,8 @@ def _parse_partition(
     *,
     input_format: str,
 ) -> Iterator[tuple[str, Any]]:
+    from ..sources.boyue import BoyueError, NonTrajectoryCapture
+
     for source_ref, payload, _listed_digest in records:
         try:
             # Distinguish an invalid input root from an internal parser TypeError.
@@ -233,7 +236,18 @@ def _parse_partition(
                 loads(payload)
                 raise _InvalidCaptureRoot("capture root must be an object")
             row = parse_payload(source_ref, payload, input_format=input_format)  # type: ignore[arg-type]
+        except NonTrajectoryCapture:
+            yield (
+                "error",
+                {
+                    "source_ref": source_ref,
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "reason": "non_trajectory_endpoint",
+                    "error_type": "NonTrajectoryCapture",
+                },
+            )
         except (
+            BoyueError,
             TokenPlanError,
             SXFError,
             DeepInfraError,
@@ -241,6 +255,7 @@ def _parse_partition(
             AnthropicCaptureError,
             ChatCompletionsAdapterError,
             ResponsesAdapterError,
+            SnapshotUnicodeError,
             orjson.JSONDecodeError,
             ValidationError,
             _InvalidCaptureRoot,
@@ -386,6 +401,8 @@ def _build_partition(
     for scope, values in rows:
         if scope[0] == "parse_failure":
             for _kind, value in values:
+                # This is a skipped archive, counted by skip_reason_counts.
+                # excluded_records is reserved for parsed quarantine records.
                 yield "counts", {"input_files": 1, "skipped_inputs": 1}
                 yield "diagnostic", value
             continue
@@ -482,6 +499,7 @@ def _publish_partition(
     run_id: str | None = None,
     output_credentials_path: str | None = None,
     retain_s3_auxiliary: bool = False,
+    output_owner: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     if retain_s3_auxiliary and (
         not isinstance(run_id, str)
@@ -499,6 +517,7 @@ def _publish_partition(
         run_id=run_id,
         output_credentials_path=output_credentials_path,
         retain_s3_auxiliary=retain_s3_auxiliary,
+        output_owner=output_owner,
     )
     output_objects = 0
     started = time.monotonic()
@@ -536,12 +555,18 @@ def _publish_partition(
                         counts[name] += value
                     continue
                 if kind in {"diagnostic", "record"}:
+                    if kind == "diagnostic":
+                        reason_counts[built["reason"]] += 1
                     if kind == "record":
                         counts["quarantined_records"] += 1
                         audit = built["normalization_audit"]
                         counts["excluded_records"] += int(audit["tag"] == "excluded")
                         for reason in audit["reason_codes"]:
                             reason_counts[reason] += 1
+                    # S3 keeps summary counts only. Diagnostic details remain
+                    # available for filesystem output, without S3 sidecars.
+                    if store.local_path is None:
+                        continue
                     database.execute(
                         "INSERT INTO lines VALUES (?,?,?)",
                         (
@@ -601,6 +626,8 @@ def _publish_partition(
             database.commit()
             parts = {}
             for kind in ("lineage", "diagnostic", "objects"):
+                if kind == "diagnostic" and store.local_path is None:
+                    continue
                 identity = f"{run_id}_" if retain_s3_auxiliary else ""
                 part_basename = f"._{kind}_part_{identity}{partition_id:06d}.ndjson"
                 part_name = f"{DIAGNOSTICS_DIRECTORY}/{part_basename}"
@@ -642,8 +669,9 @@ def _config_hash(config: SparkNormalizeConfig) -> str:
         "max_prefix_shards": config.max_prefix_shards,
         "normalizer_revision": NORMALIZER_REVISION,
         "spark_conf": config.spark_conf(),
-        "spark_execution_revision": "bounded-components-v5-external-prefix-sort",
+        "spark_execution_revision": "bounded-components-v6-single-record-spill",
         "retain_s3_auxiliary": config.retain_s3_auxiliary,
+        "diagnostic_details": "filesystem_only",
         "max_output_objects": config.max_output_objects,
         "max_partition_objects": config.max_partition_objects,
         "scope_memory_bytes": config.scope_memory_bytes,
@@ -804,6 +832,8 @@ def _run_spark_job(
         output_credentials_path=config.output_credentials_path,
         retain_s3_auxiliary=config.retain_s3_auxiliary,
         allow_existing_output=config.allow_existing_output,
+        output_owner=config.output_owner,
+        resume_owned_output=config.resume_owned_output,
     )
     run_id = uuid.uuid4().hex
     store.initialize_run(run_id)
@@ -832,6 +862,18 @@ def _run_spark_job(
                 input_credentials_path=config.input_credentials_path,
             )
         )
+        if config.input_inventory_sha256:
+            from pyspark import StorageLevel
+
+            from .source import inventory_fingerprint, inventory_item, merge_inventory
+
+            listed.persist(StorageLevel.DISK_ONLY)
+            cleanup.append(listed)
+            inventory = listed.map(inventory_item).fold((0, 0, 0), merge_inventory)
+            if inventory_fingerprint(inventory) != config.input_inventory_sha256:
+                raise RuntimeError(
+                    "input inventory changed before read; no manifest published"
+                )
         raw = listed.repartition(parallelism).mapPartitions(
             lambda part: read_listed_objects(
                 part,
@@ -999,13 +1041,14 @@ def _run_spark_job(
         byte_plan_seconds,
     )
     del summary_rows, chunks, by_user, final_summaries, weights, target_bytes
-    rows = parsed.map(
-        lambda item: _planned_component_sort_key(
-            item, chunk_indexes.value, summaries.value
-        )
-    ).repartitionAndSortWithinPartitions(
-        numPartitions=shuffle_partitions,
-        partitionFunc=lambda key: _planned_partition(key, assignments.value),
+    rows = repartition_and_sort(
+        parsed.map(
+            lambda item: _planned_component_sort_key(
+                item, chunk_indexes.value, summaries.value
+            )
+        ),
+        num_partitions=shuffle_partitions,
+        partition_func=lambda key: _planned_partition(key, assignments.value),
     )
     built = rows.mapPartitions(
         lambda part: _build_sorted_partition(
@@ -1031,6 +1074,7 @@ def _run_spark_job(
             run_id=run_id,
             output_credentials_path=config.output_credentials_path,
             retain_s3_auxiliary=config.retain_s3_auxiliary,
+            output_owner=config.output_owner,
         )
     ).persist(StorageLevel.DISK_ONLY)
     cleanup.append(published)
@@ -1087,9 +1131,11 @@ def _run_spark_job(
         _merge_counts(accumulator, [item])
         # One small result per partition, never a list of its output descriptors.
         results.append(item)
-    error_count = accumulator.stats.skipped_inputs
-    if error_count:
-        accumulator.stats.skip_reason_counts["parse_failure"] = error_count
+    error_count = accumulator.stats.reason_counts.get("parse_failure", 0)
+    for reason in ("parse_failure", "non_trajectory_endpoint"):
+        count = accumulator.stats.reason_counts.get(reason, 0)
+        if count:
+            accumulator.stats.skip_reason_counts[reason] = count
 
     reporter.set_phase("merge_sidecars")
     with tempfile.TemporaryDirectory(prefix="trajfoundry-lineage-") as temp_dir:
@@ -1101,6 +1147,8 @@ def _run_spark_job(
             ("lineage", "lineage.jsonl"),
             ("diagnostic", f"{DIAGNOSTICS_DIRECTORY}/input_diagnostics.ndjson"),
         ):
+            if kind == "diagnostic" and store.local_path is None:
+                continue
             entries = sorted(
                 (item[f"{kind}_part"] for item in results if f"{kind}_part" in item),
                 key=lambda entry: entry["path"],
@@ -1143,6 +1191,33 @@ def _run_spark_job(
         for entry in part_descriptions:
             store.delete(entry["path"])
     reporter.set_phase("publish_manifest")
+    if config.input_inventory_sha256:
+        from .source import inventory_fingerprint, inventory_item, merge_inventory
+
+        # Resolve prefixes again, so newly created date-root/model/minute
+        # directories cannot escape the completion check.
+        final_shards = _resolve_prefix_shards(context, config)
+        final_inventory = (
+            context.parallelize(
+                list(final_shards), max(1, min(len(final_shards), parallelism))
+            )
+            .mapPartitions(
+                lambda part: list_shard_objects(
+                    part,
+                    input_uri=config.input_uri,
+                    input_format=config.input_format,
+                    endpoint_url=config.endpoint_url,
+                    region_name=config.region_name,
+                    input_credentials_path=config.input_credentials_path,
+                )
+            )
+            .map(inventory_item)
+            .fold((0, 0, 0), merge_inventory)
+        )
+        if inventory_fingerprint(final_inventory) != config.input_inventory_sha256:
+            raise RuntimeError(
+                "input inventory changed during processing; no manifest published"
+            )
     manifest_path = driver_work / "manifest.json"
     accumulator.write_manifest(manifest_path)
     manifest_description = store.put_file(
@@ -1157,6 +1232,7 @@ def _run_spark_job(
         "output_uri": config.output_uri,
         "output_backend": "filesystem" if store.local_path is not None else "s3",
         "input_files": accumulator.stats.input_files,
+        "skipped_inputs": accumulator.stats.skipped_inputs,
         "parse_failures": error_count,
         "trajectories": accumulator.stats.accepted
         + accumulator.stats.quarantined_trajectories,

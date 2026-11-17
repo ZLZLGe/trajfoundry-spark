@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import tempfile
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -19,9 +21,36 @@ from ..credentials import load_s3_credentials
 from ..s3 import S3Location, create_s3_client, parse_s3_uri
 
 
+def inventory_item(item):
+    name, size, etag = item
+    digest = int.from_bytes(
+        hashlib.sha256(
+            json.dumps(
+                [name, size, etag], separators=(",", ":"), ensure_ascii=True
+            ).encode()
+        ).digest(),
+        "big",
+    )
+    return 1, size, digest
+
+
+def merge_inventory(left, right):
+    return left[0] + right[0], left[1] + right[1], (left[2] + right[2]) % (1 << 256)
+
+
+def inventory_fingerprint(value):
+    return hashlib.sha256(
+        f"sha256-sum-v1:{value[0]}:{value[1]}:{value[2]:064x}".encode()
+    ).hexdigest()
+
+
 def _selected(source_ref: str, input_format: str) -> bool:
     basename = source_ref.rsplit("/", 1)[-1]
-    if input_format in {"freerouter", "deepinfra"}:
+    if input_format == "deepinfra":
+        return basename != "manifest.json" and basename.endswith((".json", ".parquet"))
+    if input_format == "boyue":
+        return basename == "raw.json"
+    if input_format == "freerouter":
         return basename.endswith(".json")
     if input_format == "tokenplan":
         return basename.startswith("req_") and basename.endswith(".json")
@@ -79,9 +108,14 @@ def _input_client(
 def _listed_objects(client, location, shard, input_format):
     if not shard or shard.startswith("/") or ".." in shard.split("/") or "\\" in shard:
         raise ValueError("unsafe input shard")
-    prefix = f"{location.prefix}{shard}"
+    root_only = shard == "."
+    if root_only and input_format != "deepinfra":
+        raise ValueError("root-only listing is supported for DeepInfra archives")
+    prefix = location.prefix if root_only else f"{location.prefix}{shard}"
     pages = client.get_paginator("list_objects_v2").paginate(
-        Bucket=location.bucket, Prefix=prefix
+        Bucket=location.bucket,
+        Prefix=prefix,
+        **({"Delimiter": "/"} if root_only else {}),
     )
     for page in pages:
         for item in page.get("Contents", ()) or ():
@@ -93,6 +127,8 @@ def _listed_objects(client, location, shard, input_format):
             ):
                 continue
             source_ref = key[len(location.prefix) :]
+            if root_only and "/" in source_ref:
+                raise OSError("root-only listing returned a nested object")
             if not source_ref or not _selected(source_ref, input_format):
                 continue
             if location.key(source_ref) != key:
@@ -161,15 +197,20 @@ def discover_prefix_shards(
                 # so returning an empty shard list would silently omit data.
                 saw_nested_content = True
             if "/" not in source_ref and _selected(source_ref, input_format):
-                raise ValueError(
-                    "automatic input prefix discovery requires selected objects "
-                    "to be below a user prefix"
-                )
+                if input_format == "deepinfra":
+                    seen.add(".")
+                    if len(seen) > max_prefix_shards:
+                        raise RuntimeError(
+                            "automatic input prefix discovery exceeded max_prefix_shards"
+                        )
+                else:
+                    raise ValueError(
+                        "automatic input prefix discovery requires selected objects "
+                        "to be below a user prefix"
+                    )
         common_prefixes = page.get("CommonPrefixes", ())
         if not isinstance(common_prefixes, (list, tuple)):
-            raise OSError(
-                "S3 delimiter listing returned malformed CommonPrefixes"
-            )
+            raise OSError("S3 delimiter listing returned malformed CommonPrefixes")
         for item in common_prefixes:
             full_prefix = item.get("Prefix") if isinstance(item, dict) else None
             if not isinstance(full_prefix, str) or not full_prefix.startswith(
@@ -232,6 +273,11 @@ def read_listed_objects(
     location = parse_s3_uri(input_uri)
     client = _input_client(endpoint_url, region_name, input_credentials_path)
     for source_ref, size, etag in objects:
+        if input_format == "deepinfra" and source_ref.endswith(".parquet"):
+            yield from _read_parquet_rows(
+                client, location, source_ref, size, etag, max_object_bytes
+            )
+            continue
         payload = _read_checked(
             client,
             location,
@@ -244,6 +290,66 @@ def read_listed_objects(
             yield from _iter_sxf_rows(source_ref, payload)
         else:
             yield source_ref, payload, hashlib.sha256(payload).hexdigest()
+
+
+def _read_parquet_rows(client, location, source_ref, size, etag, max_bytes):
+    """Pin a physical object, spool it to disk, and decode one logical row at a time.
+
+    A corrupt Parquet object fails the partition. Invalid JSON in a readable
+    raw_json row follows the normal per-record parse diagnostic path.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if size > max_bytes:
+        raise ValueError("input object exceeds configured byte budget")
+    response = client.get_object(
+        Bucket=location.bucket, Key=location.key(source_ref), IfMatch=etag
+    )
+    body = response.get("Body")
+    try:
+        if response.get("ETag") != etag or response.get("ContentLength") != size:
+            raise OSError("Parquet input changed after listing")
+        with tempfile.TemporaryFile(prefix="trajfoundry-parquet-") as handle:
+            copied = 0
+            while block := body.read(8 * 1024 * 1024):
+                copied += len(block)
+                if copied > size:
+                    raise OSError("Parquet input exceeds listed size")
+                handle.write(block)
+            if copied != size:
+                raise OSError("Parquet input is shorter than listed size")
+            handle.seek(0)
+            archive = pq.ParquetFile(handle)
+            schema = archive.schema_arrow
+            if schema.names.count("raw_json") != 1 or schema.field(
+                "raw_json"
+            ).type not in (pa.string(), pa.large_string()):
+                raise ValueError(
+                    "DeepInfra Parquet requires one string raw_json column"
+                )
+            index = 0
+            for batch in archive.iter_batches(
+                batch_size=1, columns=["raw_json"], use_threads=False
+            ):
+                for scalar in batch.column(0):
+                    value = scalar.as_py()
+                    payload = b"null" if value is None else value.encode("utf-8")
+                    if len(payload) > max_bytes:
+                        raise ValueError(
+                            "Parquet logical record exceeds configured byte budget"
+                        )
+                    yield (
+                        f"{source_ref}#L{index:08d}",
+                        payload,
+                        hashlib.sha256(payload).hexdigest(),
+                    )
+                    index += 1
+            if index != archive.metadata.num_rows:
+                raise OSError("Parquet row count mismatch")
+    finally:
+        if body is not None:
+            body.close()
 
 
 def _iter_sxf_rows(source_ref: str, payload: bytes) -> Iterator[tuple[str, bytes, str]]:

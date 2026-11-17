@@ -9,7 +9,7 @@ from typing import Literal
 
 from .storage import local_output_path
 
-InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
+InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +41,9 @@ class SparkNormalizeConfig:
     # match and are replaced when the new successful run produces different
     # bytes; the final manifest remains authoritative.
     allow_existing_output: bool = False
+    output_owner: str | None = None
+    resume_owned_output: bool = False
+    input_inventory_sha256: str | None = None
 
     driver_cores: int | None = None
     driver_memory: str | None = None
@@ -67,6 +70,20 @@ class SparkNormalizeConfig:
     max_root_bytes: int = 2 * 1024 * 1024 * 1024
 
     def __post_init__(self) -> None:
+        import re
+
+        for name in ("output_owner", "input_inventory_sha256"):
+            value = getattr(self, name)
+            if value is not None and not re.fullmatch(r"[a-f0-9]{64}", value):
+                raise ValueError(f"{name} must be a sha256 digest")
+        if self.resume_owned_output and (
+            not self.output_owner
+            or not self.input_inventory_sha256
+            or self.allow_existing_output
+        ):
+            raise ValueError(
+                "owned resume requires input fingerprint and owner, without replacement"
+            )
         if not self.input_uri.startswith("s3://"):
             raise ValueError("input_uri must be an s3:// URI")
         # Filesystem output is a Driver/Executor shared directory, not private
@@ -86,7 +103,13 @@ class SparkNormalizeConfig:
             value = getattr(self, name)
             if value is not None and not Path(value).is_absolute():
                 raise ValueError(f"{name} must be an absolute path")
-        if self.input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
+        if self.input_format not in {
+            "freerouter",
+            "tokenplan",
+            "sxf",
+            "deepinfra",
+            "boyue",
+        }:
             raise ValueError(f"unsupported input format: {self.input_format!r}")
         for name in (
             "driver_cores",

@@ -203,9 +203,7 @@ def test_invalid_completion_evidence_never_reads_s3_or_credentials(
     elif failure == "failed_driver":
         run.pod["status"]["phase"] = "Failed"
     elif failure == "exit_code":
-        run.pod["status"]["containerStatuses"][0]["state"]["terminated"][
-            "exitCode"
-        ] = 1
+        run.pod["status"]["containerStatuses"][0]["state"]["terminated"]["exitCode"] = 1
     elif failure == "wrong_runtime":
         run.runtime["architecture"] = "x86_64"
     elif failure == "wrong_output_uri":
@@ -232,10 +230,27 @@ def test_s3_manifest_digest_mismatch_fails(completed_run):
     assert not report["checks"]["manifest_hash_matches"]
 
 
-@pytest.mark.parametrize("length", [None, -1, True, 0, 9_999_999])
-def test_s3_response_lengths_are_validated_and_resources_closed(
-    completed_run, length
+@pytest.mark.parametrize("skipped,allowed", [(2, True), (1, False), (True, False)])
+def test_zero_lakehouse_trajectories_require_complete_input_accounting(
+    completed_run, skipped, allowed
 ):
+    run = completed_run
+    run.args.input_format = "boyue"
+    run.job.update(
+        input_files=3,
+        trajectories=0,
+        accepted=0,
+        quarantined_trajectories=0,
+        quarantined_records=1,
+        skipped_inputs=skipped,
+        verified_trajectory_objects=0,
+    )
+    run.write_evidence()
+    assert validate.validate_run(run.args, run.plan)["passed"] is allowed
+
+
+@pytest.mark.parametrize("length", [None, -1, True, 0, 9_999_999])
+def test_s3_response_lengths_are_validated_and_resources_closed(completed_run, length):
     run = completed_run
     run.client.response["ContentLength"] = length
     with pytest.raises(RuntimeError, match="^S3 manifest verification failed$"):

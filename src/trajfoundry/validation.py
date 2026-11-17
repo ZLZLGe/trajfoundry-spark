@@ -71,7 +71,7 @@ class _Manifest(_StrictContract):
     schema_version: Literal["trajfoundry-v2", "trajfoundry-v3", "trajfoundry-v4"]
     created_at: str
     input_root: str
-    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter"
     config_hash: str
     token_estimator: str
     counts: _ManifestCounts

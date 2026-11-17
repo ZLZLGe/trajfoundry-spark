@@ -258,7 +258,7 @@ class ToolCallCheck(StrictModel):
 
 class Metadata(StrictModel):
     source_file: str
-    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter"
     line_no: int = 0
     created_at: str = ""
     model: str = ""
@@ -268,7 +268,7 @@ class Metadata(StrictModel):
     sessionless_chunk_id: str = ""
     sub_session_id: int = Field(default=0, ge=0)
     source_type: Literal["api-router", "traj-cooperate"] = "api-router"
-    specific_source: Literal["free-router", "token-plan", "SXF", "deep-infra"] = (
+    specific_source: Literal["free-router", "token-plan", "SXF", "deep-infra", "boyue-rich"] = (
         "free-router"
     )
 
@@ -338,7 +338,7 @@ class TrajectoryNode(StrictModel):
 class Snapshot(StrictModel):
     source_path: str
     source_sha256: str
-    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter"
     session_id: str
     # Assigned by Spark's byte-balanced planner, never inferred from payload.
     sessionless_chunk_id: str = ""
