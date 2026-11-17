@@ -36,6 +36,10 @@ _CHUNK_BYTES = 8 * 1024 * 1024
 _RUN_MARKER = RUN_MARKER
 _TEMP_PREFIX = WRITE_TEMP_PREFIX
 _EXISTENCE_LIST_MAX_KEYS = 2
+_S3_SINGLE_PUT_MAX_BYTES = 5 * 1024 * 1024 * 1024
+_MULTIPART_PART_BYTES = 64 * 1024 * 1024
+_MULTIPART_MAX_PARTS = 10_000
+_MULTIPART_MAX_PART_BYTES = 5 * 1024 * 1024 * 1024
 
 
 class _MissingDiagnosticsDirectory(FileNotFoundError):
@@ -378,6 +382,8 @@ class S3OutputStore(OutputStore):
         *,
         retain_auxiliary: bool = False,
         allow_existing_output: bool = False,
+        output_owner: str | None = None,
+        resume_owned_output: bool = False,
     ) -> None:
         if type(retain_auxiliary) is not bool:
             raise TypeError("retain_auxiliary must be a boolean")
@@ -387,6 +393,8 @@ class S3OutputStore(OutputStore):
         self.client = client
         self.retain_auxiliary = retain_auxiliary
         self.allow_existing_output = allow_existing_output
+        self.output_owner = output_owner
+        self.resume_owned_output = resume_owned_output
 
     def ensure_empty(self) -> None:
         # This is a preflight, not a distributed lock. S3 callers must reserve
@@ -409,7 +417,9 @@ class S3OutputStore(OutputStore):
                     not self.retain_auxiliary
                     or not isinstance(key, str)
                     or not key.startswith(self.location.prefix)
-                    or not is_retained_s3_auxiliary_name(key[len(self.location.prefix):])
+                    or not is_retained_s3_auxiliary_name(
+                        key[len(self.location.prefix) :]
+                    )
                 ):
                     raise ValueError(
                         "output prefix is not empty; use a fresh exclusive prefix "
@@ -418,13 +428,36 @@ class S3OutputStore(OutputStore):
 
     def initialize_run(self, run_id: str) -> None:
         _validate_run_id(run_id)
+        if self.resume_owned_output:
+            if not self.output_owner or self.allow_existing_output:
+                raise ValueError(
+                    "owned resume requires an owner and forbids replacement"
+                )
+            for page in self.client.get_paginator("list_objects_v2").paginate(
+                Bucket=self.location.bucket, Prefix=self.location.prefix
+            ):
+                for item in page.get("Contents", []):
+                    if item["Key"] == self.location.key("manifest.json"):
+                        raise FileExistsError(
+                            "completed output must be validated or skipped, never resumed"
+                        )
+                    head = self.client.head_object(
+                        Bucket=self.location.bucket, Key=item["Key"]
+                    )
+                    if head.get("Metadata", {}).get("tf-owner") != self.output_owner:
+                        raise FileExistsError(
+                            "unowned output object; preserve existing files"
+                        )
+            return
         self.ensure_empty()
 
     def put_bytes(
         self, name: str, payload: bytes, *, content_type: str = "application/jsonl"
     ) -> SparkObjectDescription:
         description = SparkObjectDescription(
-            validate_output_name(name), hashlib.sha256(payload).hexdigest(), len(payload)
+            validate_output_name(name),
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
         )
         return self._put(description, payload, content_type)
 
@@ -437,12 +470,9 @@ class S3OutputStore(OutputStore):
             source.seek(0)
             return self._put(description, source, content_type)
 
-    def _put(
-        self,
-        description: SparkObjectDescription,
-        source: bytes | BinaryIO,
-        content_type: str,
-    ) -> SparkObjectDescription:
+    def _check_destination(
+        self, description: SparkObjectDescription
+    ) -> tuple[bool, dict[str, str]]:
         # The caller reserves this prefix exclusively. HEAD is a conflict
         # guard, not an atomic S3 lock: simultaneous independent runs remain
         # forbidden. Within one run, deterministic task retries are allowed.
@@ -471,6 +501,8 @@ class S3OutputStore(OutputStore):
                 conditions["IfNoneMatch"] = "*"
         else:
             metadata = head.get("Metadata") or {}
+            if self.output_owner and metadata.get("tf-owner") != self.output_owner:
+                raise FileExistsError("unowned output object; preserve existing files")
             if self.allow_existing_output:
                 # Explicit retry mode allows the new run to replace a prior
                 # attempt's object.  A matching object is still idempotent.
@@ -478,25 +510,125 @@ class S3OutputStore(OutputStore):
                     metadata.get("sha256") == description.sha256
                     and head.get("ContentLength") == description.bytes
                 ):
-                    return description
+                    return True, conditions
             elif (
                 metadata.get("sha256") == description.sha256
                 and head.get("ContentLength") == description.bytes
             ):
-                return description
+                return True, conditions
             else:
                 raise FileExistsError(
                     "conflicting S3 output bytes; existing object was preserved"
                 )
+        return False, conditions
+
+    def _put(
+        self,
+        description: SparkObjectDescription,
+        source: bytes | BinaryIO,
+        content_type: str,
+    ) -> SparkObjectDescription:
+        key = self.location.key(description.path)
+        exists, conditions = self._check_destination(description)
+        if exists:
+            return description
+        metadata = {
+            "sha256": description.sha256,
+            **({"tf-owner": self.output_owner} if self.output_owner else {}),
+        }
+        if description.bytes > _S3_SINGLE_PUT_MAX_BYTES:
+            # A merged diagnostics sidecar can exceed S3's single-PUT limit
+            # even when every executor output is small. Keep the existing
+            # conflict checks and publish only after all parts are uploaded.
+            if not self.allow_existing_output:
+                conditions["IfNoneMatch"] = "*"
+            self._put_multipart(description, source, content_type, metadata, conditions)
+            return description
         self.client.put_object(
             Bucket=self.location.bucket,
             Key=key,
             Body=source,
             ContentType=content_type,
-            Metadata={"sha256": description.sha256},
+            Metadata=metadata,
             **conditions,
         )
         return description
+
+    def _put_multipart(
+        self,
+        description: SparkObjectDescription,
+        source: bytes | BinaryIO,
+        content_type: str,
+        metadata: dict[str, str],
+        conditions: dict[str, str],
+    ) -> None:
+        part_bytes = max(
+            _MULTIPART_PART_BYTES,
+            (description.bytes + _MULTIPART_MAX_PARTS - 1) // _MULTIPART_MAX_PARTS,
+        )
+        if part_bytes > _MULTIPART_MAX_PART_BYTES:
+            raise ValueError("output exceeds S3 multipart size limits")
+        stream = io.BytesIO(source) if isinstance(source, bytes) else source
+        key = self.location.key(description.path)
+        created = self.client.create_multipart_upload(
+            Bucket=self.location.bucket,
+            Key=key,
+            ContentType=content_type,
+            Metadata=metadata,
+        )
+        upload_id = created["UploadId"]
+        try:
+            parts = []
+            digest = hashlib.sha256()
+            remaining = description.bytes
+            while remaining:
+                expected = min(part_bytes, remaining)
+                payload = stream.read(expected)
+                if not isinstance(payload, bytes) or len(payload) != expected:
+                    raise ValueError("multipart source size changed during upload")
+                digest.update(payload)
+                number = len(parts) + 1
+                uploaded = self.client.upload_part(
+                    Bucket=self.location.bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    PartNumber=number,
+                    Body=payload,
+                    ContentLength=len(payload),
+                )
+                parts.append({"PartNumber": number, "ETag": uploaded["ETag"]})
+                remaining -= len(payload)
+                del payload
+            if stream.read(1) or digest.hexdigest() != description.sha256:
+                raise ValueError("multipart source hash or size changed during upload")
+            # Ceph can ignore IfNoneMatch on completion. Repeat the HEAD/LIST
+            # conflict guard after the long upload as well. Exclusive ownership
+            # of the output prefix remains required; this is not an S3 lock.
+            exists, final_conditions = self._check_destination(description)
+            if not exists:
+                conditions.update(final_conditions)
+                self.client.complete_multipart_upload(
+                    Bucket=self.location.bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                    **conditions,
+                )
+        except BaseException as error:
+            try:
+                self.client.abort_multipart_upload(
+                    Bucket=self.location.bucket, Key=key, UploadId=upload_id
+                )
+            except Exception:  # noqa: BLE001 - preserve the original upload failure
+                error.add_note(
+                    "S3 multipart abort failed; uncommitted parts may remain"
+                )
+            raise
+        if exists:
+            # Another identical retry completed first; keep its published bytes.
+            self.client.abort_multipart_upload(
+                Bucket=self.location.bucket, Key=key, UploadId=upload_id
+            )
 
     def _missing_key_confirmed_by_listing(self, key: str) -> bool:
         """Confirm absence using the same credentials and a bounded exact prefix.
@@ -576,7 +708,9 @@ class S3OutputStore(OutputStore):
                 "ContentLength" in response
                 and response["ContentLength"] != description.bytes
             ):
-                raise ValueError("S3 output hash or size does not match its description")
+                raise ValueError(
+                    "S3 output hash or size does not match its description"
+                )
             digest = hashlib.sha256()
             size = 0
             while True:
@@ -594,7 +728,9 @@ class S3OutputStore(OutputStore):
                     )
                 digest.update(chunk)
             if size != description.bytes or digest.hexdigest() != description.sha256:
-                raise ValueError("S3 output hash or size does not match its description")
+                raise ValueError(
+                    "S3 output hash or size does not match its description"
+                )
         finally:
             close = getattr(body, "close", None)
             if callable(close):
@@ -613,6 +749,8 @@ def create_output_store(
     output_credentials_path: str | None = None,
     retain_s3_auxiliary: bool = False,
     allow_existing_output: bool = False,
+    output_owner: str | None = None,
+    resume_owned_output: bool = False,
 ) -> OutputStore:
     if type(retain_s3_auxiliary) is not bool:
         raise TypeError("retain_s3_auxiliary must be a boolean")
@@ -621,7 +759,9 @@ def create_output_store(
     path = local_output_path(output_uri)
     if path is not None:
         if retain_s3_auxiliary:
-            raise ValueError("retaining auxiliary objects is supported only for S3 output")
+            raise ValueError(
+                "retaining auxiliary objects is supported only for S3 output"
+            )
         return LocalOutputStore(path, run_id)
     options: dict[str, Any] = {}
     if output_credentials_path is not None:
@@ -634,6 +774,8 @@ def create_output_store(
         client,
         retain_auxiliary=retain_s3_auxiliary,
         allow_existing_output=allow_existing_output,
+        output_owner=output_owner,
+        resume_owned_output=resume_owned_output,
     )
 
 
