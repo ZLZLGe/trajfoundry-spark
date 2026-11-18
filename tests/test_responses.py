@@ -21,6 +21,34 @@ from trajfoundry.quality import enrich_trajectory
 from trajfoundry.streaming import streaming_prefix_leaves
 
 
+def test_final_refusal_replaces_partial_delta_in_compact_stream() -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "m", "input": "q", "stream": True},
+            response_body=[
+                {
+                    "type": "response.refusal.delta",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Can",
+                },
+                {
+                    "type": "response.refusal.done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "refusal": "Cannot comply.",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {"status": "completed", "output": []},
+                },
+            ],
+        )
+    )
+    assert snapshot.wire_complete and snapshot.outcome == "success"
+    assert [message.content for message in snapshot.response] == ["Cannot comply."]
+
+
 def _capture(
     *, request_body: dict, response_body: object, status_code: int = 200
 ) -> dict:

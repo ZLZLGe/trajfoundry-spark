@@ -735,7 +735,8 @@ def test_generated_missing_ids_are_stable_across_repeated_parses() -> None:
     assert "__unknown_tool__" not in first.model_dump_json()
 
 
-def test_raw_sse_text_is_supported() -> None:
+@pytest.mark.parametrize("text", ["hello", "one\u2028two\u2029three"])
+def test_raw_sse_text_is_supported(text: str) -> None:
     payloads = [
         (
             "message_start",
@@ -754,20 +755,21 @@ def test_raw_sse_text_is_supported() -> None:
             {
                 "type": "content_block_delta",
                 "index": 0,
-                "delta": {"type": "text_delta", "text": "hello"},
+                "delta": {"type": "text_delta", "text": text},
             },
         ),
         ("content_block_stop", {"type": "content_block_stop", "index": 0}),
         ("message_stop", {"type": "message_stop"}),
     ]
     raw_sse = "".join(
-        f"event: {event}\ndata: {json.dumps(data)}\n\n" for event, data in payloads
+        f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        for event, data in payloads
     )
 
     snapshot = _parse(_capture(response_body=raw_sse, is_stream=True))
 
     assert snapshot.outcome == "success"
-    assert snapshot.response[0].content == "hello"
+    assert snapshot.response[0].content == text
 
 
 @pytest.mark.parametrize(

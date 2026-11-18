@@ -1667,6 +1667,8 @@ def _items_from_events(events: Sequence[Mapping[str, Any]]) -> list[dict[str, An
             continue
         is_done = event_type.endswith(".done")
         value = event.get("text") if is_done else event.get("delta")
+        if event_type == "response.refusal.done":
+            value = event.get("refusal", value)
         if event_type.startswith(("response.output_text.", "response.refusal.")):
             if not isinstance(value, str) or output_index in completed_indexes:
                 continue

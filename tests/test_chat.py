@@ -286,6 +286,121 @@ def test_normalized_stream_is_parsed_as_one_final_object_with_array_content() ->
     assert snapshot.wire_complete is True
 
 
+@pytest.mark.parametrize(
+    ("fields", "expected_content", "expected_reasoning"),
+    [
+        ({"content": None, "refusal": "Declined"}, "Declined", ""),
+        ({"content": "Partial", "refusal": "Declined"}, "Partial\nDeclined", ""),
+        ({"content": "Declined", "refusal": "Declined"}, "Declined", ""),
+        (
+            {
+                "content": [
+                    {"type": "text", "text": "Partial: "},
+                    {"type": "refusal", "refusal": "Declined"},
+                ],
+                "refusal": "Declined",
+            },
+            "Partial: Declined",
+            "",
+        ),
+        ({"reasoning_content": "", "reasoning": "legacy"}, "", "legacy"),
+        ({"reasoning_content": " \n", "reasoning": "legacy"}, "", "legacy"),
+        (
+            {
+                "reasoning_content": "only primary",
+                "reasoning": "legacy",
+                "reasoning_details": [
+                    {"type": "reasoning.text", "text": "only primary"}
+                ],
+            },
+            "",
+            "only primary",
+        ),
+        (
+            {
+                "reasoning_details": [
+                    {"type": "reasoning.text", "text": "one"},
+                    {"type": "reasoning.summary", "summary": " two"},
+                    {"type": "reasoning.encrypted", "data": "opaque"},
+                ]
+            },
+            "",
+            "one two",
+        ),
+        (
+            {"reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}]},
+            "",
+            "",
+        ),
+        (
+            {
+                "reasoning_details": [
+                    {"text": "explicit plaintext"},
+                    {"text": "opaque", "data": "x"},
+                ]
+            },
+            "",
+            "explicit plaintext",
+        ),
+        (
+            {
+                "content": [
+                    {"type": "text", "text": "Partial "},
+                    {"type": "refusal", "refusal": "No"},
+                    {"type": "refusal", "refusal": " more"},
+                ],
+                "refusal": "No more",
+            },
+            "Partial No more",
+            "",
+        ),
+    ],
+)
+def test_chat_refusal_and_reasoning_survive_replay_and_final_output(
+    fields: dict, expected_content: str, expected_reasoning: str
+) -> None:
+    from trajfoundry.output_contract import project_message
+    from trajfoundry.spark.build import build_scope
+
+    user = {"role": "user", "content": "question"}
+    assistant = {"role": "assistant", **fields}
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "m", "messages": [user, assistant, user]},
+            response_body=_completion(assistant),
+        )
+    )
+    assert snapshot.wire_complete and snapshot.outcome == "success"
+    assert snapshot.history[1] == snapshot.response[0]
+    [built] = build_scope([snapshot])
+    for message in (built.node.messages[1], built.node.messages[-1]):
+        parsed = project_message(message)
+        assert parsed["content"] == expected_content
+        assert parsed["reasoning_content"] == expected_reasoning
+        assert parsed.get("reasoning_details") == fields.get("reasoning_details")
+
+
+def test_malformed_optional_reasoning_block_keeps_valid_reply():
+    reply = {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_details": [
+            {"type": "reasoning.text", "text": "why"},
+            7,
+        ],
+    }
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "m", "messages": [{"role": "user", "content": "q"}]},
+            response_body=_completion(reply),
+        )
+    )
+    assert snapshot.outcome == "success" and snapshot.wire_complete
+    assert snapshot.response[0].reasoning_content == "why"
+    assert snapshot.response[0].content == "answer"
+    assert "invalid_reasoning_details" in {issue.code for issue in snapshot.issues}
+
+
 def test_response_tool_call_accepts_null_content() -> None:
     snapshot = _parse(
         _capture(

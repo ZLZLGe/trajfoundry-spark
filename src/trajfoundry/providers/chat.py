@@ -35,7 +35,6 @@ _KNOWN_NON_TEXT_PART_TYPES = {
     "input_audio",
     "input_file",
     "input_image",
-    "refusal",
 }
 
 
@@ -112,14 +111,15 @@ def _render_content(content: Any, *, path: str, issues: list[AuditIssue]) -> str
             continue
 
         part_type = part.get("type")
-        if part_type in _TEXT_PART_TYPES:
-            value = part.get("text")
+        if part_type in _TEXT_PART_TYPES or part_type == "refusal":
+            field = "refusal" if part_type == "refusal" else "text"
+            value = part.get(field)
             if not isinstance(value, str):
                 _issue(
                     issues,
                     "invalid_text_part",
                     part_path,
-                    f"text is {type(value).__name__}, not string",
+                    f"{field} is {type(value).__name__}, not string",
                 )
                 rendered.append(_compact_json(value))
             else:
@@ -151,35 +151,95 @@ def _parse_arguments(
         return {"raw": value}
 
 
-def _reasoning_content(
+def _assistant_content(
     message: Mapping[str, Any], *, path: str, issues: list[AuditIssue]
 ) -> str:
-    """Prefer ``reasoning_content`` and fall back to legacy ``reasoning``."""
+    parts = message.get("content")
+    content = _render_content(parts, path=f"{path}.content", issues=issues)
+    refusal = message.get("refusal")
+    if refusal is None or refusal == "":
+        return content
+    if not isinstance(refusal, str):
+        _issue(issues, "invalid_refusal", f"{path}.refusal", "expected a string")
+        refusal = _compact_json(refusal)
+    refusal_parts = (
+        [
+            part["refusal"]
+            for part in parts
+            if isinstance(part, Mapping)
+            and part.get("type") == "refusal"
+            and isinstance(part.get("refusal"), str)
+        ]
+        if isinstance(parts, list)
+        else []
+    )
+    if (
+        refusal == content
+        or refusal in refusal_parts
+        or refusal == "".join(refusal_parts)
+    ):
+        return content
+    return f"{content}\n{refusal}" if content else refusal
 
-    if message.get("reasoning_content") is not None:
-        value = message["reasoning_content"]
-        if isinstance(value, str):
-            return value
+
+def _reasoning_details(
+    message: Mapping[str, Any], *, path: str, issues: list[AuditIssue]
+) -> list[dict[str, Any]] | None:
+    details = message.get("reasoning_details")
+    if details is None:
+        return None
+    blocks = (
+        [part for part in details if isinstance(part, dict)]
+        if isinstance(details, list)
+        else []
+    )
+    if not isinstance(details, list) or len(blocks) != len(details):
         _issue(
             issues,
-            "invalid_reasoning_content",
-            f"{path}.reasoning_content",
-            f"expected string or null; got {type(value).__name__}",
+            "invalid_reasoning_details",
+            f"{path}.reasoning_details",
+            "expected an array of objects; retained valid blocks",
+            severity=Severity.WARNING,
         )
-        return _compact_json(value)
+    return blocks or None
 
-    value = message.get("reasoning")
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    _issue(
-        issues,
-        "invalid_reasoning",
-        f"{path}.reasoning",
-        f"expected string or null; got {type(value).__name__}",
-    )
-    return _compact_json(value)
+
+def _reasoning_content(
+    message: Mapping[str, Any],
+    details: list[dict[str, Any]] | None,
+    *,
+    path: str,
+    issues: list[AuditIssue],
+) -> str:
+    whitespace = ""
+    for name in ("reasoning_content", "reasoning"):
+        value = message.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            _issue(
+                issues,
+                f"invalid_{name}",
+                f"{path}.{name}",
+                f"expected string or null; got {type(value).__name__}",
+            )
+            return _compact_json(value)
+        if value.strip():
+            return value
+        whitespace = whitespace or value
+
+    text = []
+    for detail in details or ():
+        kind = detail.get("type")
+        if kind in ("reasoning.text", "text", "reasoning_text") or (
+            kind is None and detail.keys() <= {"text", "id", "index", "type"}
+        ):
+            text.append(_text(detail.get("text")))
+        elif kind in ("reasoning.summary", "summary_text"):
+            text.append(_text(detail.get("summary")) or _text(detail.get("text")))
+        elif kind == "thinking":
+            text.append(_text(detail.get("thinking")))
+    return "".join(text) or whitespace
 
 
 def _decoded_turn_metadata(
@@ -509,18 +569,17 @@ def _assistant_message(
     path: str,
     context: _ParseContext,
 ) -> Message:
+    details = _reasoning_details(raw_message, path=path, issues=context.issues)
     return Message(
         role="assistant",
-        content=_render_content(
-            raw_message.get("content"),
-            path=f"{path}.content",
-            issues=context.issues,
-        ),
+        content=_assistant_content(raw_message, path=path, issues=context.issues),
         reasoning_content=_reasoning_content(
             raw_message,
+            details,
             path=path,
             issues=context.issues,
         ),
+        reasoning_details=details,
         tool_calls=_parse_tool_calls(
             raw_message.get("tool_calls"),
             path=f"{path}.tool_calls",

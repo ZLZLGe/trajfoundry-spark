@@ -124,6 +124,85 @@ def test_adapt_deepinfra_does_not_promote_request_id_to_session_id() -> None:
     assert "session_id" not in capture
 
 
+def test_chat_stream_preserves_refusal_reasoning_and_ordered_content() -> None:
+    from trajfoundry.models import Snapshot
+    from trajfoundry.output_contract import project_message
+    from trajfoundry.spark.adapters import parse_payload
+    from trajfoundry.spark.build import build_scope
+
+    deltas = [
+        {
+            "role": "assistant",
+            "content": "A",
+            "refusal": "No",
+            "reasoning_details": [
+                {"index": 1, "type": "reasoning.encrypted", "data": "a"},
+                {"index": 0, "id": "r", "type": "reasoning.text", "text": "why\u2028"},
+            ],
+        },
+        {
+            "content": [
+                {"type": "text", "text": "B\u2029"},
+                {"type": "image_url", "image_url": {"url": "$media_ref:image"}},
+            ],
+            "refusal": " reply",
+            "reasoning_details": [
+                {"id": "r", "text": "now"},
+                {"index": 1, "data": "b"},
+            ],
+        },
+        {
+            "content": "C",
+            "reasoning_details": [
+                {"index": 0, "id": "s", "type": "reasoning.text", "text": " second"},
+                {"index": 0, "id": "r", "text": "!"},
+            ],
+        },
+    ]
+    chunks = [
+        {
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": "stop" if i == 2 else None,
+                }
+            ],
+        }
+        for i, delta in enumerate(deltas)
+    ]
+    wire = "".join(
+        f"data: {json.dumps(chunk, ensure_ascii=False)}\r\n\r\n" for chunk in chunks
+    )
+    envelope = _envelope(
+        request_body={
+            "model": "test-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "q"}],
+        },
+        response_body=wire + "data: [DONE]\r\n\r\n",
+    )
+    snapshot = Snapshot.model_validate_json(
+        parse_payload(
+            "test.json", json.dumps(envelope).encode(), input_format="deepinfra"
+        ).snapshot_json
+    )
+    assert snapshot.wire_complete and snapshot.outcome == "success"
+    [built] = build_scope([snapshot])
+    parsed = project_message(built.node.messages[-1])
+    assert (
+        parsed["content"]
+        == 'AB\u2029{"image_url":{"url":"$media_ref:image"},"type":"image_url"}C\nNo reply'
+    )
+    assert parsed["reasoning_content"] == "why\u2028now! second"
+    assert parsed["reasoning_details"] == [
+        {"index": 0, "id": "r", "type": "reasoning.text", "text": "why\u2028now!"},
+        {"index": 0, "id": "s", "type": "reasoning.text", "text": " second"},
+        {"index": 1, "type": "reasoning.encrypted", "data": "ab"},
+    ]
+
+
 def test_adapt_deepinfra_aggregates_chat_sse_to_final_response() -> None:
     capture = adapt_deepinfra_envelope(
         _envelope(

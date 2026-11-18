@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from io import StringIO
 from typing import Any
 
 from trajfoundry.identity import normalize_session_id, request_session_id
@@ -855,8 +856,8 @@ def _decode_sse_text(body: str, issues: list[AuditIssue]) -> list[dict[str, Any]
         event_name = ""
         data_lines = []
 
-    for raw_line in body.splitlines():
-        line = raw_line.rstrip("\r")
+    for raw_line in StringIO(body, newline=None):
+        line = raw_line.removesuffix("\n")
         if not line:
             flush()
         elif line.startswith(":"):
