@@ -216,6 +216,28 @@ def test_adapt_deepinfra_aggregates_chat_sse_to_final_response() -> None:
     assert capture["response_body"]["choices"][0]["message"]["content"] == "hello"
 
 
+def test_invalid_content_delta_preserves_surrounding_chat_text() -> None:
+    from trajfoundry.sources.sxf import normalize_response_body
+
+    chunks = [
+        {
+            "object": "chat.completion.chunk",
+            "choices": [
+                {"index": 0, "delta": {"content": value}, "finish_reason": finish}
+            ],
+        }
+        for value, finish in [("hel", None), (7, None), ("lo", "stop")]
+    ]
+    wire = (
+        "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        + "data: [DONE]\n\n"
+    )
+    message = normalize_response_body("/v1/chat/completions", wire)["choices"][0][
+        "message"
+    ]
+    assert message["content"] == "hello"
+
+
 @pytest.mark.parametrize(
     "path", ["/v1/messages/count_tokens", "/messages/count_tokens"]
 )

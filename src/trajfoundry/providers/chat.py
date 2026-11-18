@@ -81,6 +81,13 @@ def _issue(
     )
 
 
+def _refusal_part_value(part: Mapping[str, Any]) -> Any:
+    value = part.get("refusal")
+    if isinstance(value, str) and value:
+        return value
+    return part.get("text", value)
+
+
 def _render_content(content: Any, *, path: str, issues: list[AuditIssue]) -> str:
     """Render Chat content without dropping ordered multimodal evidence."""
 
@@ -113,7 +120,9 @@ def _render_content(content: Any, *, path: str, issues: list[AuditIssue]) -> str
         part_type = part.get("type")
         if part_type in _TEXT_PART_TYPES or part_type == "refusal":
             field = "refusal" if part_type == "refusal" else "text"
-            value = part.get(field)
+            value = (
+                _refusal_part_value(part) if part_type == "refusal" else part.get(field)
+            )
             if not isinstance(value, str):
                 _issue(
                     issues,
@@ -160,15 +169,21 @@ def _assistant_content(
     if refusal is None or refusal == "":
         return content
     if not isinstance(refusal, str):
-        _issue(issues, "invalid_refusal", f"{path}.refusal", "expected a string")
-        refusal = _compact_json(refusal)
+        _issue(
+            issues,
+            "invalid_refusal",
+            f"{path}.refusal",
+            "expected a string",
+            severity=Severity.WARNING,
+        )
+        return content
     refusal_parts = (
         [
-            part["refusal"]
+            value
             for part in parts
             if isinstance(part, Mapping)
             and part.get("type") == "refusal"
-            and isinstance(part.get("refusal"), str)
+            and isinstance(value := _refusal_part_value(part), str)
         ]
         if isinstance(parts, list)
         else []

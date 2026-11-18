@@ -63,7 +63,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-11-18.spark.1"
+NORMALIZER_REVISION = "2026-11-18.spark.2"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -714,6 +714,9 @@ class _ReplayReasoning:
     def observe(
         self, contributor: Snapshot, replies: Iterable[tuple[int, str]]
     ) -> None:
+        # An anonymous bucket can contain unrelated users replaying identical prompts.
+        if not (self.leaf.session_id or self.leaf.user_id or self.leaf.end_user_id):
+            return
         if (contributor.user_id, contributor.end_user_id) != (
             self.leaf.user_id,
             self.leaf.end_user_id,

@@ -285,11 +285,7 @@ def _aggregate_chat_chunks(text: str) -> dict[str, Any]:
             if isinstance(role, str) and role:
                 state["role"] = role
             content = delta.get("content")
-            if content is not None:
-                if not isinstance(content, (str, list)):
-                    raise SXFError(
-                        "Chat Completions content delta must be text or an array"
-                    )
+            if isinstance(content, (str, list)):
                 state["content"].append(content)
             for field in ("refusal", "reasoning_content", "reasoning"):
                 value = delta.get(field)

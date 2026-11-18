@@ -290,6 +290,13 @@ def test_normalized_stream_is_parsed_as_one_final_object_with_array_content() ->
     ("fields", "expected_content", "expected_reasoning"),
     [
         ({"content": None, "refusal": "Declined"}, "Declined", ""),
+        ({"content": "Answer", "refusal": 7}, "Answer", ""),
+        (
+            {"content": [{"type": "text", "text": "Answer: "},
+                         {"type": "refusal", "text": "Declined"}],
+             "refusal": "Declined"},
+            "Answer: Declined", "",
+        ),
         ({"content": "Partial", "refusal": "Declined"}, "Partial\nDeclined", ""),
         ({"content": "Declined", "refusal": "Declined"}, "Declined", ""),
         (
@@ -457,6 +464,30 @@ def test_malformed_optional_reasoning_block_keeps_valid_reply():
     assert snapshot.response[0].reasoning_content == "why"
     assert snapshot.response[0].content == "answer"
     assert "invalid_reasoning_details" in {issue.code for issue in snapshot.issues}
+
+
+def test_anonymous_matches_never_supply_another_captures_reasoning(tmp_path):
+    from trajfoundry.spark.bounded import build_scope_bounded
+    from trajfoundry.spark.build import build_scope
+
+    user = {"role": "user", "content": "Hi"}
+    answer = {"role": "assistant", "content": "Hello"}
+
+    def anonymous(path, messages, reply):
+        raw = _capture(
+            request_body={"model": "m", "messages": messages},
+            response_body=_completion(reply),
+        )
+        raw.pop("session_id")
+        return parse_chat_capture(raw, source_path=path, source_sha256=path)
+
+    first = anonymous("first", [user], {**answer, "reasoning_content": "original"})
+    later = anonymous("later", [user, answer, user], {**answer, "content": "Done"})
+    [built] = build_scope([first, later])
+    assert not built.node.messages[1].reasoning_content
+    assert [built] == list(
+        build_scope_bounded([first, later], workspace_parent=tmp_path)
+    )
 
 
 def test_response_tool_call_accepts_null_content() -> None:
