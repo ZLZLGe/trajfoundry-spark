@@ -380,6 +380,64 @@ def test_chat_refusal_and_reasoning_survive_replay_and_final_output(
         assert parsed.get("reasoning_details") == fields.get("reasoning_details")
 
 
+@pytest.mark.parametrize(
+    ("originals", "replay_text", "expected"),
+    [
+        (["two plus two"], "", "two plus two"),
+        (["same", "same"], "", "same"),
+        (["one", "two"], "", ""),
+        (["one", ""], "", ""),
+        (["hidden"], "replayed", "replayed"),
+    ],
+)
+def test_prefix_recovers_only_agreeing_original_replies(
+    originals, replay_text, expected, tmp_path
+):
+    from trajfoundry.spark.bounded import build_scope_bounded
+    from trajfoundry.spark.build import build_scope
+
+    def capture(path, history, reply):
+        raw = _capture(
+            request_body={"model": "m", "messages": history},
+            response_body=_completion(reply),
+        )
+        return parse_chat_capture(raw, source_path=path, source_sha256=path)
+
+    question = {"role": "user", "content": "What is 2 + 2?"}
+    answer = {"role": "assistant", "content": "Four"}
+    captures = [
+        capture(
+            f"source-{i}",
+            [question],
+            {**answer, "reasoning_details": [{"type": "reasoning.text", "text": text}]},
+        )
+        for i, text in enumerate(originals)
+    ]
+    # Same reply text in a different branch must never supply another turn's reasoning.
+    other = capture(
+        "other",
+        [{"role": "user", "content": "Another question"}],
+        {**answer, "reasoning_content": "different branch"},
+    )
+    leaf = capture(
+        "leaf",
+        [
+            question,
+            {**answer, "reasoning_content": replay_text},
+            {"role": "user", "content": "Thanks"},
+        ],
+        {"role": "assistant", "content": "Welcome"},
+    )
+    items = [*captures, other, leaf]
+    memory = build_scope(items)
+    disk = tuple(build_scope_bounded(reversed(items), workspace_parent=tmp_path))
+    assert disk == memory
+    assert len(memory) == 2
+    [longest] = [item.node for item in memory if len(item.node.messages) == 4]
+    assert longest.messages[1].reasoning_content == expected
+    assert leaf.history[1].reasoning_content == replay_text
+
+
 def test_malformed_optional_reasoning_block_keeps_valid_reply():
     reply = {
         "role": "assistant",

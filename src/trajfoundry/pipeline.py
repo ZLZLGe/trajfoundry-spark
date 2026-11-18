@@ -63,7 +63,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-11-05.spark.2"
+NORMALIZER_REVISION = "2026-11-18.spark.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -255,7 +255,7 @@ def config_hash(config: PipelineConfig) -> str:
             "parent_turn_id",
             "forked_from_thread_id",
         ],
-        "leaf_messages": "request_history_plus_response_without_contributor_backfill",
+        "leaf_messages": "leaf_with_unanimous_original_response_reasoning",
         "developer_messages": "preserve",
         "instructions": "trajectory_field",
         "strict_wire_completion": True,
@@ -682,6 +682,61 @@ def _source_file_and_line(source_path: str) -> tuple[str, int]:
     return Path(source_path).name, 0
 
 
+def _response_reasoning(snapshot: Snapshot) -> list[tuple[int, str]]:
+    """Only original replies can supply evidence; replayed histories cannot."""
+    return [
+        (position, message.reasoning_content or "")
+        for position, message in enumerate(
+            snapshot.response, start=len(snapshot.history)
+        )
+        if message.role == "assistant"
+        and (message.content.strip() or message.tool_calls)
+    ]
+
+
+class _ReplayReasoning:
+    """Fill missing text only from originals on an already verified exact prefix."""
+
+    def __init__(self, leaf: Snapshot):
+        self.leaf = leaf
+        self.missing = {
+            pos
+            for pos, message in enumerate(leaf.history)
+            if message.role == "assistant"
+            and not (message.reasoning_content or "").strip()
+            # The visible prefix alone cannot authenticate an existing opaque envelope.
+            and not message.reasoning
+            and not message.reasoning_details
+            and (message.content.strip() or message.tool_calls)
+        }
+        self.originals: dict[int, str | None] = {}
+
+    def observe(
+        self, contributor: Snapshot, replies: Iterable[tuple[int, str]]
+    ) -> None:
+        if (contributor.user_id, contributor.end_user_id) != (
+            self.leaf.user_id,
+            self.leaf.end_user_id,
+        ):
+            return
+        for position, text in replies:
+            if (
+                position in self.missing
+                and self.originals.setdefault(position, text) != text
+            ):
+                # Conflicting originals (including an empty original) veto this turn.
+                self.originals[position] = None
+
+    def messages(self) -> list[Message]:
+        messages = [*self.leaf.history, *self.leaf.response]
+        for position, text in self.originals.items():
+            if text and text.strip():
+                messages[position] = messages[position].model_copy(
+                    update={"reasoning_content": text}
+                )
+        return messages
+
+
 def _trajectory_from_leaf(
     leaf: Snapshot, contributors: Iterable[Snapshot]
 ) -> TrajectoryNode:
@@ -689,6 +744,11 @@ def _trajectory_from_leaf(
     contributor_list = list(contributors)
     if not any(item.source_path == leaf.source_path for item in contributor_list):
         contributor_list.append(leaf)
+    replay = _ReplayReasoning(leaf)
+    if replay.missing:
+        for contributor in contributor_list:
+            if contributor.source_path != leaf.source_path:
+                replay.observe(contributor, _response_reasoning(contributor))
     tools, server_calls, agent_messages, compaction_items, contributor_issues = (
         _merge_contributor_metadata(
             contributor_list,
@@ -755,7 +815,7 @@ def _trajectory_from_leaf(
             ],
         )
     return TrajectoryNode(
-        messages=[*leaf.history, *leaf.response],
+        messages=replay.messages(),
         multimodal_file_mapping=multimodal_file_mapping,
         tools=tools,
         agent_messages=agent_messages,

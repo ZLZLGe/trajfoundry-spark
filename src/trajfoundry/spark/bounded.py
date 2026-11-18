@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import zstandard
+from pydantic import TypeAdapter
 
 from ..canonical import trajectory_id
 from ..identity import aggregation_scope, normalize_session_id
@@ -46,6 +47,8 @@ from ..pipeline import (
     _merge_contributor_metadata,
     _merged_issues,
     _minimal_evidence,
+    _ReplayReasoning,
+    _response_reasoning,
     _routing_snapshot,
     _snapshot_order_key,
     _source_file_and_line,
@@ -72,6 +75,8 @@ _STABLE = "captured_at,turn_id,request_id,source_path,source_sha256"
 _PREFIX_RUN_BYTES = 64 * _MIB
 _PREFIX_MERGE_FANIN = 64
 _PREFIX_INSERT_BATCH = 20_000
+_ContributorProjection = tuple[Snapshot, list[tuple[int, str]]]
+_CONTRIBUTOR_CODEC = TypeAdapter(_ContributorProjection)
 
 
 class BoundedBuildLimitError(RuntimeError):
@@ -228,14 +233,17 @@ class _ContributorLeafSummary:
 
 
 def _trajectory_from_leaf(
-    leaf: Snapshot, contributors: Iterable[Snapshot]
+    leaf: Snapshot, contributors: Iterable[_ContributorProjection]
 ) -> TrajectoryNode:
     summary = _ContributorLeafSummary(leaf)
+    replay = _ReplayReasoning(leaf)
     session_id = normalize_session_id(leaf.session_id)
 
     def observed_contributors() -> Iterator[Snapshot]:
-        for contributor in contributors:
+        for contributor, replies in contributors:
             summary.observe(contributor)
+            if replay.missing and contributor.source_path != leaf.source_path:
+                replay.observe(contributor, replies)
             yield contributor
         if not summary.has_leaf:
             summary.observe(leaf)
@@ -300,7 +308,7 @@ def _trajectory_from_leaf(
             ],
         )
     return TrajectoryNode(
-        messages=[*leaf.history, *leaf.response],
+        messages=replay.messages(),
         multimodal_file_mapping=multimodal_file_mapping,
         tools=tools,
         agent_messages=agent_messages,
@@ -423,9 +431,9 @@ class _DiskScope:
         raw = model.model_dump_json().encode("utf-8")
         return self.compressor.compress(raw), len(raw)
 
-    def snapshot(
-        self, source_path: str, budget: _Budget, *, metadata=False
-    ) -> Snapshot:
+    def _capture_bytes(
+        self, source_path: str, budget: _Budget, *, metadata: bool
+    ) -> bytes:
         columns = "metadata,metadata_bytes" if metadata else "payload,raw_bytes"
         row = self.db.execute(
             f"SELECT {columns} FROM captures WHERE source_path=?", (source_path,)
@@ -433,7 +441,15 @@ class _DiskScope:
         if row is None:
             raise RuntimeError("bounded Spark snapshot disappeared from scratch")
         budget.add(row[1] + 512)
-        return Snapshot.model_validate_json(self.decompressor.decompress(row[0]))
+        return self.decompressor.decompress(row[0])
+
+    def snapshot(
+        self, source_path: str, budget: _Budget, *, metadata: bool = False
+    ) -> Snapshot:
+        raw = self._capture_bytes(source_path, budget, metadata=metadata)
+        if metadata:
+            return _CONTRIBUTOR_CODEC.validate_json(raw)[0]
+        return Snapshot.model_validate_json(raw)
 
     def ingest(self, snapshots: Iterable[Snapshot]) -> None:
         progress = _Progress("spool")
@@ -441,7 +457,13 @@ class _DiskScope:
             payload, size = self.encode(item)
             _Budget(self.limits.max_snapshot_bytes, "snapshot").add(size)
             projection = item.model_copy(update={"history": [], "response": []})
-            metadata, metadata_size = self.encode(projection)
+            # Prefix membership already proves message alignment. Keep the
+            # reply positions/text alongside metadata, without duplicating history.
+            encoded = _CONTRIBUTOR_CODEC.dump_json(
+                (projection, _response_reasoning(item))
+            )
+            metadata, metadata_size = self.compressor.compress(encoded), len(encoded)
+            del encoded
             eligible = _eligible(item)
             is_evidence = eligible and (
                 _has_spawn_response(item)
@@ -860,9 +882,11 @@ class _DiskScope:
             parameters,
         )
 
-    def contributors(self, paths, budget: _Budget) -> Iterator[Snapshot]:
+    def contributors(self, paths, budget: _Budget) -> Iterator[_ContributorProjection]:
         for (path,) in paths:
-            yield self.snapshot(path, budget, metadata=True)
+            yield _CONTRIBUTOR_CODEC.validate_json(
+                self._capture_bytes(path, budget, metadata=True)
+            )
 
     def flatten(self) -> None:
         progress = _Progress("flat-dedup")

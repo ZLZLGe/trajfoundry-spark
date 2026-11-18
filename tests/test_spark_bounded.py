@@ -15,6 +15,7 @@ from trajfoundry.models import (
     ToolCall,
     ToolDefinition,
 )
+from trajfoundry.pipeline import _response_reasoning
 from trajfoundry.pipeline import _trajectory_from_leaf as reference_leaf
 from trajfoundry.spark import bounded
 from trajfoundry.spark.bounded import (
@@ -366,7 +367,11 @@ def test_streaming_leaf_metadata_matches_existing_contract(monkeypatch, name):
         values = list(contributors)
         expected = reference_leaf(leaf, values)
         projected = (
-            item.model_copy(update={"history": [], "response": []}) for item in values
+            (
+                item.model_copy(update={"history": [], "response": []}),
+                _response_reasoning(item),
+            )
+            for item in values
         )
         actual = bounded._trajectory_from_leaf(leaf, projected)
         assert actual == expected
