@@ -15,6 +15,7 @@ from copy import deepcopy
 from typing import Any
 
 from trajfoundry.audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
+from trajfoundry.identity import normalize_session_id
 from trajfoundry.models import (
     AgentMessageEvidence,
     AuditIssue,
@@ -32,6 +33,12 @@ from trajfoundry.tool_names import is_spawn_tool_name, qualify_tool_name
 
 class ResponsesAdapterError(ValueError):
     """Raised when a value is not a Responses capture at all."""
+
+
+def _text(value: Any) -> str:
+    """Return a string identity value without coercing non-string data."""
+
+    return value if isinstance(value, str) else ""
 
 
 _CLIENT_CALL_TYPES = {
@@ -1660,6 +1667,8 @@ def _items_from_events(events: Sequence[Mapping[str, Any]]) -> list[dict[str, An
             continue
         is_done = event_type.endswith(".done")
         value = event.get("text") if is_done else event.get("delta")
+        if event_type == "response.refusal.done":
+            value = event.get("refusal", value)
         if event_type.startswith(("response.output_text.", "response.refusal.")):
             if not isinstance(value, str) or output_index in completed_indexes:
                 continue
@@ -2043,6 +2052,17 @@ def _identity_metadata(
             )
             saw_codex_metadata = True
 
+    metadata = request.get("metadata")
+    if isinstance(metadata, Mapping):
+        encoded_user = metadata.get("user_id")
+        if isinstance(encoded_user, str):
+            try:
+                user_identity = _strict_json_loads(encoded_user)
+            except (TypeError, ValueError):
+                user_identity = None
+            if isinstance(user_identity, Mapping):
+                encoded_sources.append(("request_body.metadata.user_id", user_identity))
+
     # Headers are untrusted transport metadata. Read only the explicit identity
     # allowlist and retain only their decoded identity values.
     raw_headers = capture.get("request_headers")
@@ -2106,6 +2126,8 @@ def _identity_metadata(
         for source_name, source in all_sources:
             for key in keys:
                 value = source.get(key)
+                if key == "session_id":
+                    value = normalize_session_id(value)
                 if isinstance(value, str) and value:
                     values.append((f"{source_name}.{key}", value))
                     break
@@ -2156,6 +2178,7 @@ def parse_responses_capture(
     *,
     source_path: str,
     source_sha256: str,
+    archive_without_http_status: bool = False,
 ) -> Snapshot:
     """Parse one freerouter ``/v1/responses`` capture.
 
@@ -2200,7 +2223,9 @@ def parse_responses_capture(
         and status_code_raw > 0
         else None
     )
-    transport_error = status_code is None
+    transport_error = status_code is None and not (
+        archive_without_http_status and status_code_raw is None
+    )
     if transport_error:
         _issue(
             issues,
@@ -2208,7 +2233,7 @@ def parse_responses_capture(
             "status_code",
             "capture has no valid HTTP status code",
         )
-    elif not 200 <= status_code < 300:
+    elif status_code is not None and not 200 <= status_code < 300:
         _issue(
             issues,
             "openai_api_error",
@@ -2250,12 +2275,10 @@ def parse_responses_capture(
     )
 
     identity, saw_codex_metadata = _identity_metadata(capture, request, issues)
-    capture_session = capture.get("session_id")
-    session_id = identity.get("session_id", "") or (
-        capture_session if isinstance(capture_session, str) else ""
-    )
+    capture_session = normalize_session_id(capture.get("session_id"))
+    session_id = identity.get("session_id", "") or capture_session
     if (
-        isinstance(capture_session, str)
+        capture_session
         and identity.get("session_id")
         and capture_session != identity["session_id"]
     ):
@@ -2356,6 +2379,7 @@ def parse_responses_capture(
         request_id=request_id if isinstance(request_id, str) else "",
         model=model,
         user_id=user_id,
+        end_user_id=_text(capture.get("end_user_id")),
         harness=harness,
         instructions=instructions,
         history=history,

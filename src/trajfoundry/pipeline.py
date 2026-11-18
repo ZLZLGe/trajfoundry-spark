@@ -26,6 +26,7 @@ from .canonical import (
     trajectory_id,
 )
 from .export import SCHEMA_VERSION, OutputSet
+from .identity import normalize_session_id
 from .io import CaptureSource, LocalCaptureSource, decode_capture
 from .models import (
     AgentMessageRecord,
@@ -62,7 +63,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-09-28.1"
+NORMALIZER_REVISION = "2026-11-18.spark.2"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -254,7 +255,7 @@ def config_hash(config: PipelineConfig) -> str:
             "parent_turn_id",
             "forked_from_thread_id",
         ],
-        "leaf_messages": "request_history_plus_response_without_contributor_backfill",
+        "leaf_messages": "leaf_with_unanimous_original_response_reasoning",
         "developer_messages": "preserve",
         "instructions": "trajectory_field",
         "strict_wire_completion": True,
@@ -269,7 +270,7 @@ def parse_capture(
     *,
     source_path: str,
     source_sha256: str,
-    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter",
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter",
     response_is_normalized_final: bool = False,
     multimodal_file_mapping: Sequence[MediaMapping] | None = None,
 ) -> Snapshot:
@@ -282,6 +283,7 @@ def parse_capture(
     arguments = {
         "source_path": source_path,
         "source_sha256": source_sha256,
+        "archive_without_http_status": source_name == "boyue",
     }
     if endpoint in {"/v1/responses", "/responses"}:
         snapshot = parse_responses_capture(capture, **arguments)
@@ -680,12 +682,76 @@ def _source_file_and_line(source_path: str) -> tuple[str, int]:
     return Path(source_path).name, 0
 
 
+def _response_reasoning(snapshot: Snapshot) -> list[tuple[int, str]]:
+    """Only original replies can supply evidence; replayed histories cannot."""
+    return [
+        (position, message.reasoning_content or "")
+        for position, message in enumerate(
+            snapshot.response, start=len(snapshot.history)
+        )
+        if message.role == "assistant"
+        and (message.content.strip() or message.tool_calls)
+    ]
+
+
+class _ReplayReasoning:
+    """Fill missing text only from originals on an already verified exact prefix."""
+
+    def __init__(self, leaf: Snapshot):
+        self.leaf = leaf
+        self.missing = {
+            pos
+            for pos, message in enumerate(leaf.history)
+            if message.role == "assistant"
+            and not (message.reasoning_content or "").strip()
+            # The visible prefix alone cannot authenticate an existing opaque envelope.
+            and not message.reasoning
+            and not message.reasoning_details
+            and (message.content.strip() or message.tool_calls)
+        }
+        self.originals: dict[int, str | None] = {}
+
+    def observe(
+        self, contributor: Snapshot, replies: Iterable[tuple[int, str]]
+    ) -> None:
+        # An anonymous bucket can contain unrelated users replaying identical prompts.
+        if not (self.leaf.session_id or self.leaf.user_id or self.leaf.end_user_id):
+            return
+        if (contributor.user_id, contributor.end_user_id) != (
+            self.leaf.user_id,
+            self.leaf.end_user_id,
+        ):
+            return
+        for position, text in replies:
+            if (
+                position in self.missing
+                and self.originals.setdefault(position, text) != text
+            ):
+                # Conflicting originals (including an empty original) veto this turn.
+                self.originals[position] = None
+
+    def messages(self) -> list[Message]:
+        messages = [*self.leaf.history, *self.leaf.response]
+        for position, text in self.originals.items():
+            if text and text.strip():
+                messages[position] = messages[position].model_copy(
+                    update={"reasoning_content": text}
+                )
+        return messages
+
+
 def _trajectory_from_leaf(
     leaf: Snapshot, contributors: Iterable[Snapshot]
 ) -> TrajectoryNode:
+    session_id = normalize_session_id(leaf.session_id)
     contributor_list = list(contributors)
     if not any(item.source_path == leaf.source_path for item in contributor_list):
         contributor_list.append(leaf)
+    replay = _ReplayReasoning(leaf)
+    if replay.missing:
+        for contributor in contributor_list:
+            if contributor.source_path != leaf.source_path:
+                replay.observe(contributor, _response_reasoning(contributor))
     tools, server_calls, agent_messages, compaction_items, contributor_issues = (
         _merge_contributor_metadata(
             contributor_list,
@@ -708,7 +774,7 @@ def _trajectory_from_leaf(
                 detail="missing user id was published as no_user_id",
             )
         )
-    if not leaf.session_id:
+    if not session_id:
         synthesized_identity_issues.append(
             AuditIssue(
                 code="metadata_session_id_synthesized",
@@ -726,6 +792,7 @@ def _trajectory_from_leaf(
         "tokenplan": ("api-router", "token-plan"),
         "sxf": ("traj-cooperate", "SXF"),
         "deepinfra": ("api-router", "deep-infra"),
+        "boyue": ("api-router", "boyue-rich"),
     }[leaf.source_name]
     contributor_user_ids = {
         snapshot.user_id for snapshot in contributor_list if snapshot.user_id
@@ -751,7 +818,7 @@ def _trajectory_from_leaf(
             ],
         )
     return TrajectoryNode(
-        messages=[*leaf.history, *leaf.response],
+        messages=replay.messages(),
         multimodal_file_mapping=multimodal_file_mapping,
         tools=tools,
         agent_messages=agent_messages,
@@ -769,7 +836,9 @@ def _trajectory_from_leaf(
             created_at=leaf.captured_at,
             model=leaf.model,
             user_id=leaf.user_id or "no_user_id",
-            session_id=leaf.session_id or "no_session_id",
+            end_user_id=leaf.end_user_id,
+            session_id=session_id or "no_session_id",
+            sessionless_chunk_id=leaf.sessionless_chunk_id if not session_id else "",
             source_type=source_type,
             specific_source=specific_source,
         ),
@@ -1625,6 +1694,7 @@ def _export(
     *,
     output: Any | None = None,
     input_root_label: str | None = None,
+    started_at_ms: int | None = None,
 ) -> Any:
     output = output or OutputSet(
         config.output_root,
@@ -1634,6 +1704,7 @@ def _export(
     last_progress_at = started_at
     processed_records = 0
     processed_trajectories = 0
+    parse_failure_count = 0
     total_records = state.capture_count()
     total_trajectories = state.trajectory_count()
 
@@ -1677,6 +1748,7 @@ def _export(
                 log_progress()
                 continue
             if status == "failed":
+                parse_failure_count += 1
                 reason_code = reason.partition(":")[0]
                 if reason_code not in {
                     "tokenplan_empty_envelope",
@@ -1722,6 +1794,8 @@ def _export(
             input_root=input_root_label or str(config.input_root),
             input_format=config.input_format,
             config_hash=configuration_hash,
+            started_at_ms=started_at_ms,
+            parse_failure_count=parse_failure_count,
         )
         log_progress(force=True)
         LOGGER.info(
@@ -2077,6 +2151,7 @@ def normalize_source(
     the ephemeral state from the immutable input inventory.
     """
 
+    started_at_ms = time.time_ns() // 1_000_000
     if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
     if max_shard_bytes <= 0:
@@ -2118,8 +2193,6 @@ def normalize_source(
                 parse_workers=parse_workers,
             )
         stats.ingest_seconds = time.monotonic() - stage_started_at
-        if stats.discovered == 0:
-            raise ValueError(f"capture source is empty: {source.label}")
         stage_started_at = time.monotonic()
         _build_trajectories(state, stats, build_workers=build_workers)
         stats.build_seconds = time.monotonic() - stage_started_at
@@ -2130,6 +2203,7 @@ def normalize_source(
             configuration_hash,
             output=output_factory(),
             input_root_label=source.label,
+            started_at_ms=started_at_ms,
         )
         stats.export_seconds = time.monotonic() - stage_started_at
         LOGGER.info(
@@ -2144,6 +2218,7 @@ def normalize_source(
 def normalize(config: PipelineConfig) -> PipelineStats:
     """Normalize a capture tree and atomically publish manifest-backed shards."""
 
+    started_at_ms = time.time_ns() // 1_000_000
     input_root = config.input_root.resolve()
     output_root = config.output_root.resolve()
     if not input_root.is_dir():
@@ -2195,7 +2270,12 @@ def normalize(config: PipelineConfig) -> PipelineStats:
         _build_trajectories(state, stats)
         stats.build_seconds = time.monotonic() - stage_started_at
         stage_started_at = time.monotonic()
-        _export(state, normalized_config, configuration_hash)
+        _export(
+            state,
+            normalized_config,
+            configuration_hash,
+            started_at_ms=started_at_ms,
+        )
         stats.export_seconds = time.monotonic() - stage_started_at
         LOGGER.info(
             "【阶段汇总】读取耗时=%.1f秒，构建耗时=%.1f秒，输出耗时=%.1f秒",

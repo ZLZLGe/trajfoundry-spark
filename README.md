@@ -84,7 +84,45 @@ residue again and removes it after the replacement manifest is published. See
 [`docs/dolphinscheduler.md`](docs/dolphinscheduler.md) for normalization and
 classification workflow configuration.
 
-The input tree is read-only. A non-empty output directory requires `--resume`:
+The independent Spark implementation for the TokenPlan workload is documented
+in [`docs/spark-tokenplan.md`](docs/spark-tokenplan.md). Develop with Client mode
+from Jupyter and `spark/submit_client_probe.sh`; the synthetic probe does not
+read or write business S3. Production uses a DolphinScheduler SHELL task with
+`spark-submit --deploy-mode cluster`, so the Driver is not left on the scheduler
+Worker. The business job requires a fresh, exclusive S3 output prefix or an
+empty shared filesystem directory. Spark `--output-uri` accepts an absolute
+path or `file:///absolute/path`; separate Pods' `/tmp` directories are not a
+shared output location. Local output uses a driver-owned run marker, atomic
+no-overwrite writes, identical-content retries, and hash verification before
+publishing the manifest last. Failed-run files are retained for diagnosis.
+`spark/local_output_smoke.py` selects complete small user prefixes, reads real
+S3 input, and writes only shared local output; it cannot create an S3 output
+client. Its optional `--input-credentials-file` is loaded inside Executors,
+without serializing secrets through the Driver. Runtime users must have access
+to the protected credential file and shared output directory; Hadoop S3A
+settings do not supply boto3 credentials. Unit/local integration tests and a
+successful synthetic cluster probe do not by themselves establish real-S3
+business acceptance. See the Spark guide for the smoke parameters and current
+verification status.
+The no-snapshot path reads `req_*.json` in executor
+partitions, shuffles records by scope, builds one scope at a time, and writes
+the existing flat-v4 JSONL output. It does not persist Snapshot Parquet or a
+long-lived `spark-work` tree, but Spark may use executor-local disk for
+shuffle/spill. The original Python entry points remain available for other
+formats and as a rollback path.
+For Spark only, missing-session users are divided into approximately equal-byte
+chunks, weighted by the uncompressed, normalized Snapshot JSON. Requests are
+ordered by capture time and stable source identity; time is an ordering key,
+not a fixed-hour aggregation boundary. `shuffle_partitions` determines the
+proportional chunk target, not a hard limit on the number of chunks. A request
+is never split, and oversized requests occupy their own chunks. Prefix matching
+and subagent mounting do not cross chunk boundaries. Chunk weights also balance
+the physical Spark tasks. Real sessions and the ordinary Python deployment keep
+their existing grouping semantics.
+
+For the ordinary Python CLI below, the input tree is read-only and a non-empty
+output directory requires `--resume` (the independent Spark path instead
+requires a fresh destination):
 
 ```bash
 uv run trajfoundry normalize --resume \
@@ -99,6 +137,9 @@ deterministic for the same inputs and configuration; only the manifest creation
 timestamp changes.
 
 ## Normalization rules
+
+Batch feedback fields, node-local token estimates, and the Python/Spark grouping
+boundaries are described in [production feedback](docs/production-feedback.md).
 
 - Supported endpoints: OpenAI-compatible Responses and Anthropic Messages,
   plus OpenAI-compatible Chat Completions. Streamed and non-streamed responses

@@ -286,6 +286,210 @@ def test_normalized_stream_is_parsed_as_one_final_object_with_array_content() ->
     assert snapshot.wire_complete is True
 
 
+@pytest.mark.parametrize(
+    ("fields", "expected_content", "expected_reasoning"),
+    [
+        ({"content": None, "refusal": "Declined"}, "Declined", ""),
+        ({"content": "Answer", "refusal": 7}, "Answer", ""),
+        (
+            {"content": [{"type": "text", "text": "Answer: "},
+                         {"type": "refusal", "text": "Declined"}],
+             "refusal": "Declined"},
+            "Answer: Declined", "",
+        ),
+        ({"content": "Partial", "refusal": "Declined"}, "Partial\nDeclined", ""),
+        ({"content": "Declined", "refusal": "Declined"}, "Declined", ""),
+        (
+            {
+                "content": [
+                    {"type": "text", "text": "Partial: "},
+                    {"type": "refusal", "refusal": "Declined"},
+                ],
+                "refusal": "Declined",
+            },
+            "Partial: Declined",
+            "",
+        ),
+        ({"reasoning_content": "", "reasoning": "legacy"}, "", "legacy"),
+        ({"reasoning_content": " \n", "reasoning": "legacy"}, "", "legacy"),
+        (
+            {
+                "reasoning_content": "only primary",
+                "reasoning": "legacy",
+                "reasoning_details": [
+                    {"type": "reasoning.text", "text": "only primary"}
+                ],
+            },
+            "",
+            "only primary",
+        ),
+        (
+            {
+                "reasoning_details": [
+                    {"type": "reasoning.text", "text": "one"},
+                    {"type": "reasoning.summary", "summary": " two"},
+                    {"type": "reasoning.encrypted", "data": "opaque"},
+                ]
+            },
+            "",
+            "one two",
+        ),
+        (
+            {"reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}]},
+            "",
+            "",
+        ),
+        (
+            {
+                "reasoning_details": [
+                    {"text": "explicit plaintext"},
+                    {"text": "opaque", "data": "x"},
+                ]
+            },
+            "",
+            "explicit plaintext",
+        ),
+        (
+            {
+                "content": [
+                    {"type": "text", "text": "Partial "},
+                    {"type": "refusal", "refusal": "No"},
+                    {"type": "refusal", "refusal": " more"},
+                ],
+                "refusal": "No more",
+            },
+            "Partial No more",
+            "",
+        ),
+    ],
+)
+def test_chat_refusal_and_reasoning_survive_replay_and_final_output(
+    fields: dict, expected_content: str, expected_reasoning: str
+) -> None:
+    from trajfoundry.output_contract import project_message
+    from trajfoundry.spark.build import build_scope
+
+    user = {"role": "user", "content": "question"}
+    assistant = {"role": "assistant", **fields}
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "m", "messages": [user, assistant, user]},
+            response_body=_completion(assistant),
+        )
+    )
+    assert snapshot.wire_complete and snapshot.outcome == "success"
+    assert snapshot.history[1] == snapshot.response[0]
+    [built] = build_scope([snapshot])
+    for message in (built.node.messages[1], built.node.messages[-1]):
+        parsed = project_message(message)
+        assert parsed["content"] == expected_content
+        assert parsed["reasoning_content"] == expected_reasoning
+        assert parsed.get("reasoning_details") == fields.get("reasoning_details")
+
+
+@pytest.mark.parametrize(
+    ("originals", "replay_text", "expected"),
+    [
+        (["two plus two"], "", "two plus two"),
+        (["same", "same"], "", "same"),
+        (["one", "two"], "", ""),
+        (["one", ""], "", ""),
+        (["hidden"], "replayed", "replayed"),
+    ],
+)
+def test_prefix_recovers_only_agreeing_original_replies(
+    originals, replay_text, expected, tmp_path
+):
+    from trajfoundry.spark.bounded import build_scope_bounded
+    from trajfoundry.spark.build import build_scope
+
+    def capture(path, history, reply):
+        raw = _capture(
+            request_body={"model": "m", "messages": history},
+            response_body=_completion(reply),
+        )
+        return parse_chat_capture(raw, source_path=path, source_sha256=path)
+
+    question = {"role": "user", "content": "What is 2 + 2?"}
+    answer = {"role": "assistant", "content": "Four"}
+    captures = [
+        capture(
+            f"source-{i}",
+            [question],
+            {**answer, "reasoning_details": [{"type": "reasoning.text", "text": text}]},
+        )
+        for i, text in enumerate(originals)
+    ]
+    # Same reply text in a different branch must never supply another turn's reasoning.
+    other = capture(
+        "other",
+        [{"role": "user", "content": "Another question"}],
+        {**answer, "reasoning_content": "different branch"},
+    )
+    leaf = capture(
+        "leaf",
+        [
+            question,
+            {**answer, "reasoning_content": replay_text},
+            {"role": "user", "content": "Thanks"},
+        ],
+        {"role": "assistant", "content": "Welcome"},
+    )
+    items = [*captures, other, leaf]
+    memory = build_scope(items)
+    disk = tuple(build_scope_bounded(reversed(items), workspace_parent=tmp_path))
+    assert disk == memory
+    assert len(memory) == 2
+    [longest] = [item.node for item in memory if len(item.node.messages) == 4]
+    assert longest.messages[1].reasoning_content == expected
+    assert leaf.history[1].reasoning_content == replay_text
+
+
+def test_malformed_optional_reasoning_block_keeps_valid_reply():
+    reply = {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_details": [
+            {"type": "reasoning.text", "text": "why"},
+            7,
+        ],
+    }
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "m", "messages": [{"role": "user", "content": "q"}]},
+            response_body=_completion(reply),
+        )
+    )
+    assert snapshot.outcome == "success" and snapshot.wire_complete
+    assert snapshot.response[0].reasoning_content == "why"
+    assert snapshot.response[0].content == "answer"
+    assert "invalid_reasoning_details" in {issue.code for issue in snapshot.issues}
+
+
+def test_anonymous_matches_never_supply_another_captures_reasoning(tmp_path):
+    from trajfoundry.spark.bounded import build_scope_bounded
+    from trajfoundry.spark.build import build_scope
+
+    user = {"role": "user", "content": "Hi"}
+    answer = {"role": "assistant", "content": "Hello"}
+
+    def anonymous(path, messages, reply):
+        raw = _capture(
+            request_body={"model": "m", "messages": messages},
+            response_body=_completion(reply),
+        )
+        raw.pop("session_id")
+        return parse_chat_capture(raw, source_path=path, source_sha256=path)
+
+    first = anonymous("first", [user], {**answer, "reasoning_content": "original"})
+    later = anonymous("later", [user, answer, user], {**answer, "content": "Done"})
+    [built] = build_scope([first, later])
+    assert not built.node.messages[1].reasoning_content
+    assert [built] == list(
+        build_scope_bounded([first, later], workspace_parent=tmp_path)
+    )
+
+
 def test_response_tool_call_accepts_null_content() -> None:
     snapshot = _parse(
         _capture(

@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from trajfoundry.identity import normalize_session_id
 from trajfoundry.models import (
     AuditIssue,
     FunctionCall,
@@ -34,7 +35,6 @@ _KNOWN_NON_TEXT_PART_TYPES = {
     "input_audio",
     "input_file",
     "input_image",
-    "refusal",
 }
 
 
@@ -81,6 +81,13 @@ def _issue(
     )
 
 
+def _refusal_part_value(part: Mapping[str, Any]) -> Any:
+    value = part.get("refusal")
+    if isinstance(value, str) and value:
+        return value
+    return part.get("text", value)
+
+
 def _render_content(content: Any, *, path: str, issues: list[AuditIssue]) -> str:
     """Render Chat content without dropping ordered multimodal evidence."""
 
@@ -111,14 +118,17 @@ def _render_content(content: Any, *, path: str, issues: list[AuditIssue]) -> str
             continue
 
         part_type = part.get("type")
-        if part_type in _TEXT_PART_TYPES:
-            value = part.get("text")
+        if part_type in _TEXT_PART_TYPES or part_type == "refusal":
+            field = "refusal" if part_type == "refusal" else "text"
+            value = (
+                _refusal_part_value(part) if part_type == "refusal" else part.get(field)
+            )
             if not isinstance(value, str):
                 _issue(
                     issues,
                     "invalid_text_part",
                     part_path,
-                    f"text is {type(value).__name__}, not string",
+                    f"{field} is {type(value).__name__}, not string",
                 )
                 rendered.append(_compact_json(value))
             else:
@@ -150,35 +160,101 @@ def _parse_arguments(
         return {"raw": value}
 
 
-def _reasoning_content(
+def _assistant_content(
     message: Mapping[str, Any], *, path: str, issues: list[AuditIssue]
 ) -> str:
-    """Prefer ``reasoning_content`` and fall back to legacy ``reasoning``."""
-
-    if message.get("reasoning_content") is not None:
-        value = message["reasoning_content"]
-        if isinstance(value, str):
-            return value
+    parts = message.get("content")
+    content = _render_content(parts, path=f"{path}.content", issues=issues)
+    refusal = message.get("refusal")
+    if refusal is None or refusal == "":
+        return content
+    if not isinstance(refusal, str):
         _issue(
             issues,
-            "invalid_reasoning_content",
-            f"{path}.reasoning_content",
-            f"expected string or null; got {type(value).__name__}",
+            "invalid_refusal",
+            f"{path}.refusal",
+            "expected a string",
+            severity=Severity.WARNING,
         )
-        return _compact_json(value)
-
-    value = message.get("reasoning")
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    _issue(
-        issues,
-        "invalid_reasoning",
-        f"{path}.reasoning",
-        f"expected string or null; got {type(value).__name__}",
+        return content
+    refusal_parts = (
+        [
+            value
+            for part in parts
+            if isinstance(part, Mapping)
+            and part.get("type") == "refusal"
+            and isinstance(value := _refusal_part_value(part), str)
+        ]
+        if isinstance(parts, list)
+        else []
     )
-    return _compact_json(value)
+    if (
+        refusal == content
+        or refusal in refusal_parts
+        or refusal == "".join(refusal_parts)
+    ):
+        return content
+    return f"{content}\n{refusal}" if content else refusal
+
+
+def _reasoning_details(
+    message: Mapping[str, Any], *, path: str, issues: list[AuditIssue]
+) -> list[dict[str, Any]] | None:
+    details = message.get("reasoning_details")
+    if details is None:
+        return None
+    blocks = (
+        [part for part in details if isinstance(part, dict)]
+        if isinstance(details, list)
+        else []
+    )
+    if not isinstance(details, list) or len(blocks) != len(details):
+        _issue(
+            issues,
+            "invalid_reasoning_details",
+            f"{path}.reasoning_details",
+            "expected an array of objects; retained valid blocks",
+            severity=Severity.WARNING,
+        )
+    return blocks or None
+
+
+def _reasoning_content(
+    message: Mapping[str, Any],
+    details: list[dict[str, Any]] | None,
+    *,
+    path: str,
+    issues: list[AuditIssue],
+) -> str:
+    whitespace = ""
+    for name in ("reasoning_content", "reasoning"):
+        value = message.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            _issue(
+                issues,
+                f"invalid_{name}",
+                f"{path}.{name}",
+                f"expected string or null; got {type(value).__name__}",
+            )
+            return _compact_json(value)
+        if value.strip():
+            return value
+        whitespace = whitespace or value
+
+    text = []
+    for detail in details or ():
+        kind = detail.get("type")
+        if kind in ("reasoning.text", "text", "reasoning_text") or (
+            kind is None and detail.keys() <= {"text", "id", "index", "type"}
+        ):
+            text.append(_text(detail.get("text")))
+        elif kind in ("reasoning.summary", "summary_text"):
+            text.append(_text(detail.get("summary")) or _text(detail.get("text")))
+        elif kind == "thinking":
+            text.append(_text(detail.get("thinking")))
+    return "".join(text) or whitespace
 
 
 def _decoded_turn_metadata(
@@ -320,6 +396,8 @@ def _identity_metadata(
         for source_name, source in sources:
             for key in keys:
                 value = source.get(key)
+                if key == "session_id":
+                    value = normalize_session_id(value)
                 if isinstance(value, str) and value:
                     values.append((f"{source_name}.{key}", value))
                     break
@@ -506,18 +584,17 @@ def _assistant_message(
     path: str,
     context: _ParseContext,
 ) -> Message:
+    details = _reasoning_details(raw_message, path=path, issues=context.issues)
     return Message(
         role="assistant",
-        content=_render_content(
-            raw_message.get("content"),
-            path=f"{path}.content",
-            issues=context.issues,
-        ),
+        content=_assistant_content(raw_message, path=path, issues=context.issues),
         reasoning_content=_reasoning_content(
             raw_message,
+            details,
             path=path,
             issues=context.issues,
         ),
+        reasoning_details=details,
         tool_calls=_parse_tool_calls(
             raw_message.get("tool_calls"),
             path=f"{path}.tool_calls",
@@ -723,7 +800,7 @@ def _decode_response_body(
 def _parse_response(
     body: Any,
     *,
-    status_code: int,
+    status_code: int | None,
     context: _ParseContext,
 ) -> tuple[list[Message], str, str, bool]:
     issue_start = len(context.issues)
@@ -840,6 +917,7 @@ def parse_chat_capture(
     source_path: str,
     source_sha256: str,
     response_is_normalized_final: bool = False,
+    archive_without_http_status: bool = False,
 ) -> Snapshot:
     """Parse one OpenAI-compatible ``/v1/chat/completions`` capture.
 
@@ -885,6 +963,8 @@ def parse_chat_capture(
         fallback = (
             _user_id_value(capture.get(field))
             if field == "user_id"
+            else normalize_session_id(capture.get(field))
+            if field == "session_id"
             else _text(capture.get(field))
         )
         if selected and fallback and selected != fallback:
@@ -944,7 +1024,9 @@ def parse_chat_capture(
     status = capture.get("status_code")
     response: list[Message] = []
     response_model = ""
-    if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
+    if not (archive_without_http_status and status is None) and (
+        not isinstance(status, int) or isinstance(status, bool) or status <= 0
+    ):
         _issue(
             context.issues,
             "missing_http_status",
@@ -953,7 +1035,7 @@ def parse_chat_capture(
         )
         outcome = "transport_error"
         wire_complete = False
-    elif not 200 <= status < 300:
+    elif status is not None and not 200 <= status < 300:
         _issue(
             context.issues,
             "openai_api_error",
@@ -1001,6 +1083,7 @@ def parse_chat_capture(
         request_id=_text(capture.get("request_id")),
         model=model,
         user_id=user_id,
+        end_user_id=_text(capture.get("end_user_id")),
         harness=harness,
         instructions="",
         history=history,

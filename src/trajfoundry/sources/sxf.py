@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from io import StringIO
 from typing import Any
 
 
@@ -149,9 +150,10 @@ def parse_sse_events(text: str, *, allow_done: bool = False) -> list[dict[str, A
                     event["type"] = current_event
             events.append(event)
 
-    # splitlines() handles CRLF, LF, and a final unterminated line without
-    # materializing any additional copy of the response body.
-    for line in text.splitlines():
+    # SSE has CR, LF and CRLF line endings. Unicode line separators can
+    # occur literally inside a quoted JSON string in a data field.
+    for raw_line in StringIO(text, newline=None):
+        line = raw_line.removesuffix("\n")
         if line == "":
             flush()
             continue
@@ -169,7 +171,74 @@ def parse_sse_events(text: str, *, allow_done: bool = False) -> list[dict[str, A
 
 
 def _looks_like_sse(text: str) -> bool:
-    return any(line.startswith(("event:", "data:", ":")) for line in text.splitlines())
+    return any(
+        line.startswith(("event:", "data:", ":"))
+        for line in StringIO(text, newline=None)
+    )
+
+
+def _chat_content(fragments: list[Any]) -> str | list[Any]:
+    if all(isinstance(fragment, str) for fragment in fragments):
+        return "".join(fragments)
+    parts = []
+    for fragment in fragments:
+        if isinstance(fragment, list):
+            parts.extend(fragment)
+        else:
+            parts.append({"type": "text", "text": fragment})
+    return parts
+
+
+def _chat_reasoning_details(fragments: list[Any]) -> list[Any]:
+    """Join deltas with a declared block identity; keep anonymous blocks in wire order."""
+    blocks: list[dict[str, Any]] = []
+    pieces: list[dict[str, list[str]]] = []
+    indexed: dict[tuple[str, int | str], int] = {}
+    invalid = []
+    payload_fields = {"text", "summary", "thinking", "data", "signature"}
+    for fragment in fragments:
+        if not isinstance(fragment, dict):
+            invalid.append(fragment)
+            continue
+        index, identifier = fragment.get("index"), fragment.get("id")
+        keys = []
+        if isinstance(identifier, str) and identifier:
+            keys.append(("id", identifier))
+        if type(index) is int and index >= 0:
+            keys.append(("index", index))
+        # Some providers interleave multiple IDs at the same index.
+        position = next((indexed[key] for key in keys if key in indexed), None)
+        block = blocks[position] if position is not None else {}
+        same_id = bool(identifier) and block.get("id") == identifier
+        if position is None or any(
+            field not in payload_fields
+            and not (field == "index" and same_id)
+            and value is not None
+            and block.get(field) is not None
+            and block[field] != value
+            for field, value in fragment.items()
+        ):
+            position = len(blocks)
+            block = {}
+            blocks.append(block)
+            pieces.append({})
+        chunks = pieces[position]
+        for key in keys:
+            indexed[key] = position
+        for field, value in fragment.items():
+            if value is None or (field == "index" and block.get(field) is not None):
+                block.setdefault(field, value)
+            elif field in payload_fields and isinstance(value, str):
+                chunks.setdefault(field, []).append(value)
+            else:
+                chunks.pop(field, None)
+                block[field] = value
+    for block, chunks in zip(blocks, pieces, strict=True):
+        block.update((field, "".join(parts)) for field, parts in chunks.items())
+    if all(type(block.get("index")) is int for block in blocks):
+        blocks.sort(key=lambda block: block["index"])
+    # The provider adapter reports malformed optional blocks without dropping the reply.
+    return [*blocks, *invalid]
 
 
 def _aggregate_chat_chunks(text: str) -> dict[str, Any]:
@@ -201,8 +270,10 @@ def _aggregate_chat_chunks(text: str) -> dict[str, Any]:
                 {
                     "role": "assistant",
                     "content": [],
+                    "refusal": [],
                     "reasoning_content": [],
                     "reasoning": [],
+                    "reasoning_details": [],
                     "tool_calls": {},
                     "finish_reason": None,
                 },
@@ -213,10 +284,18 @@ def _aggregate_chat_chunks(text: str) -> dict[str, Any]:
             role = delta.get("role")
             if isinstance(role, str) and role:
                 state["role"] = role
-            for field in ("content", "reasoning_content", "reasoning"):
+            content = delta.get("content")
+            if isinstance(content, (str, list)):
+                state["content"].append(content)
+            for field in ("refusal", "reasoning_content", "reasoning"):
                 value = delta.get(field)
                 if isinstance(value, str):
                     state[field].append(value)
+            details = delta.get("reasoning_details")
+            if details is not None:
+                state["reasoning_details"].extend(
+                    details if isinstance(details, list) else [details]
+                )
             raw_tool_calls = delta.get("tool_calls")
             if raw_tool_calls is not None:
                 if not isinstance(raw_tool_calls, list):
@@ -260,14 +339,16 @@ def _aggregate_chat_chunks(text: str) -> dict[str, Any]:
         state = choices[index]
         message: dict[str, Any] = {
             "role": state["role"],
-            "content": "".join(state["content"]),
+            "content": _chat_content(state["content"]),
         }
-        reasoning = "".join(state["reasoning_content"])
-        if reasoning:
-            message["reasoning_content"] = reasoning
-        legacy_reasoning = "".join(state["reasoning"])
-        if legacy_reasoning:
-            message["reasoning"] = legacy_reasoning
+        for field in ("refusal", "reasoning_content", "reasoning"):
+            value = "".join(state[field])
+            if value:
+                message[field] = value
+        if state["reasoning_details"]:
+            message["reasoning_details"] = _chat_reasoning_details(
+                state["reasoning_details"]
+            )
         tool_calls = [
             call
             for _, call in sorted(state["tool_calls"].items())

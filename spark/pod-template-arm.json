@@ -1,0 +1,50 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "spark-pod",
+    "labels": {
+      "spark-monitor": "enabled"
+    }
+  },
+  "spec": {
+    "nodeSelector": {
+      "node-role.sensecore.cn/dataops-data-plane": "true",
+      "kubernetes.io/arch": "arm64"
+    },
+    "tolerations": [
+      {
+        "key": "node-role.sensecore.cn/dataops-data-plane",
+        "operator": "Equal",
+        "value": "true",
+        "effect": "NoSchedule"
+      }
+    ],
+    "containers": [
+      {
+        "name": "spark-kubernetes",
+        "env": [
+          {
+            "name": "BASE_DIR",
+            "value": "/share/dataproc"
+          }
+        ],
+        "volumeMounts": [
+          {
+            "name": "spark-event-nfs",
+            "mountPath": "/share",
+            "subPath": "dsj"
+          }
+        ]
+      }
+    ],
+    "volumes": [
+      {
+        "name": "spark-event-nfs",
+        "persistentVolumeClaim": {
+          "claimName": "spark-event-nfs-pvc"
+        }
+      }
+    ]
+  }
+}

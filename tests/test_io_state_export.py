@@ -397,11 +397,11 @@ def test_state_streams_session_and_missing_session_user_scopes(
                 state.put_snapshot(snapshot)
 
         assert list(state.aggregation_scopes()) == [
-            ("session", "no_session_id"),
             ("session", "session-1"),
             ("user", ""),
             ("user", "alice"),
             ("user", "bob"),
+            ("user", "ignored-user"),
             ("user", "no_user_id"),
         ]
         assert [
@@ -417,7 +417,7 @@ def test_state_streams_session_and_missing_session_user_scopes(
         assert [
             snapshot.source_path
             for snapshot in state.snapshots_for_aggregation_scope(
-                ("session", "no_session_id")
+                ("user", "ignored-user")
             )
         ] == ["literal-sentinel-session.json"]
         assert [

@@ -1,0 +1,79 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "spark-pod",
+    "labels": {
+      "spark-monitor": "enabled"
+    }
+  },
+  "spec": {
+    "nodeSelector": {
+      "node-role.sensecore.cn/dataops-data-plane": "true",
+      "kubernetes.io/arch": "arm64"
+    },
+    "tolerations": [
+      {
+        "key": "node-role.sensecore.cn/dataops-data-plane",
+        "operator": "Equal",
+        "value": "true",
+        "effect": "NoSchedule"
+      }
+    ],
+    "hostAliases": [
+      {
+        "ip": "10.140.87.247",
+        "hostnames": ["p-ceph-norm-inside.pjlab.org.cn"]
+      },
+      {
+        "ip": "10.135.0.243",
+        "hostnames": ["p-ceph-hdd2-inside.pjlab.org.cn"]
+      }
+    ],
+    "containers": [
+      {
+        "name": "spark-kubernetes",
+        "ports": [
+          {
+            "containerPort": 8090,
+            "name": "jmx-8090",
+            "protocol": "TCP"
+          }
+        ],
+        "env": [
+          {
+            "name": "PATH",
+            "value": "/share/envs/arm_default_venv/bin:/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          },
+          {
+            "name": "PYSPARK_PYTHON",
+            "value": "/share/envs/arm_default_venv/bin/python"
+          },
+          {
+            "name": "JAVA_HOME",
+            "value": "/opt/java/openjdk"
+          },
+          {
+            "name": "BASE_DIR",
+            "value": "/share/dataproc"
+          }
+        ],
+        "volumeMounts": [
+          {
+            "name": "spark-event-nfs",
+            "mountPath": "/share",
+            "subPath": "dsj"
+          }
+        ]
+      }
+    ],
+    "volumes": [
+      {
+        "name": "spark-event-nfs",
+        "persistentVolumeClaim": {
+          "claimName": "spark-event-nfs-pvc"
+        }
+      }
+    ]
+  }
+}

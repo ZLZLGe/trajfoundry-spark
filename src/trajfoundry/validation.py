@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from .canonical import trajectory_id
 from .export import trajectory_filename
+from .identity import normalize_session_id
 from .json_codec import loads
 from .models import AuditTag
 from .output_contract import (
@@ -70,11 +71,23 @@ class _Manifest(_StrictContract):
     schema_version: Literal["trajfoundry-v2", "trajfoundry-v3", "trajfoundry-v4"]
     created_at: str
     input_root: str
-    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter"
     config_hash: str
     token_estimator: str
     counts: _ManifestCounts
     files: list[_ManifestFile]
+    # Absence means the historical/Python identity without time windows.
+    sessionless_window_hours: Literal[8] | None = None
+    sessionless_partitioning: Literal["normalized-bytes-v1"] | None = None
+    # Optional only for reading historical manifests. New writers emit all.
+    status: Literal["SUCCEEDED"] | None = None
+    started_at_ms: NonNegativeInt | None = None
+    completed_at_ms: NonNegativeInt | None = None
+    total_bytes: NonNegativeInt | None = None
+    record_count: NonNegativeInt | None = None
+    accepted_trajectory_count: NonNegativeInt | None = None
+    quarantined_trajectory_count: NonNegativeInt | None = None
+    parse_failure_count: NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def require_current_accounting_fields(self) -> _Manifest:
@@ -89,6 +102,42 @@ class _Manifest(_StrictContract):
                 raise ValueError("v3 manifest requires counts.skip_reason_counts")
         if self.counts.excluded_records > self.counts.quarantined_records:
             raise ValueError("excluded_records cannot exceed quarantined_records")
+        if (
+            self.sessionless_partitioning is not None
+            and self.sessionless_window_hours is not None
+        ):
+            raise ValueError(
+                "manifest cannot declare both byte and time-window partitioning"
+            )
+        feedback_names = {
+            "status", "started_at_ms", "completed_at_ms", "total_bytes", "record_count",
+            "accepted_trajectory_count", "quarantined_trajectory_count",
+            "parse_failure_count",
+        }
+        if feedback_names & self.model_fields_set:
+            if any(getattr(self, name) is None for name in feedback_names):
+                raise ValueError("manifest requires all production-feedback fields")
+            if self.started_at_ms > self.completed_at_ms:
+                raise ValueError("manifest timestamps are reversed")
+            if self.accepted_trajectory_count != self.counts.accepted:
+                raise ValueError("accepted_trajectory_count disagrees with counts")
+            if self.quarantined_trajectory_count != self.counts.quarantined_trajectories:
+                raise ValueError("quarantined_trajectory_count disagrees with counts")
+            if self.parse_failure_count > min(
+                self.counts.input_files,
+                self.counts.quarantined_records + self.counts.skipped_inputs,
+            ):
+                raise ValueError("parse_failure_count exceeds failed-input accounting")
+            if self.parse_failure_count < self.counts.skip_reason_counts.get("parse_failure", 0):
+                raise ValueError("parse_failure_count omits skipped parse failures")
+            if self.record_count != self.counts.accepted + self.counts.quarantined_trajectories:
+                raise ValueError("record_count must count accepted plus quarantined trajectories")
+            data_bytes = sum(
+                entry.bytes for entry in self.files
+                if _file_kind(entry.path, self.schema_version) == "trajectory"
+            )
+            if self.total_bytes != data_bytes:
+                raise ValueError("total_bytes must exclude lineage and diagnostics")
         return self
 
 
@@ -272,6 +321,8 @@ def _validate_row(
     line_no: int,
     relative_path: str,
     allow_legacy_metadata: bool,
+    sessionless_window_hours: int = 0,
+    sessionless_partitioning: str | None = None,
     observed: _Observed,
     errors: _ErrorCollector,
 ) -> None:
@@ -290,11 +341,27 @@ def _validate_row(
             observed.mark_invalid(kind)
             errors.add(f"{context} violates the TrajectoryNode contract")
             return
-        observed.trajectory_ids[trajectory_id(node)] += 1
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            missing_session = not normalize_session_id(current.metadata.session_id)
+            chunked = bool(current.metadata.sessionless_chunk_id)
+            expected_chunked = (
+                missing_session and sessionless_partitioning == "normalized-bytes-v1"
+            )
+            if chunked != expected_chunked:
+                observed.mark_invalid(kind)
+                errors.add(f"{context} chunk identity does not match manifest partitioning")
+                return
+            pending.extend((current.sub_agent_trajectory or {}).values())
+        identifier = trajectory_id(
+            node, sessionless_window_hours=sessionless_window_hours
+        )
+        observed.trajectory_ids[identifier] += 1
         strict = is_strict_sample(node)
         if kind == "trajectory":
             try:
-                expected_filename = trajectory_filename(node)
+                expected_filename = trajectory_filename(node, identifier)
             except ValueError:
                 errors.add(f"{context} cannot produce a safe trajectory filename")
             else:
@@ -358,6 +425,8 @@ def _validate_jsonl_stream(
     file_index: int,
     relative_path: str,
     allow_legacy_metadata: bool,
+    sessionless_window_hours: int = 0,
+    sessionless_partitioning: str | None = None,
     observed: _Observed,
     errors: _ErrorCollector,
 ) -> _StreamResult:
@@ -397,6 +466,8 @@ def _validate_jsonl_stream(
                     line_no=line_no,
                     relative_path=relative_path,
                     allow_legacy_metadata=allow_legacy_metadata,
+                    sessionless_window_hours=sessionless_window_hours,
+                    sessionless_partitioning=sessionless_partitioning,
                     observed=observed,
                     errors=errors,
                 )
@@ -415,6 +486,8 @@ def _validate_jsonl_stream(
                 line_no=line_no,
                 relative_path=relative_path,
                 allow_legacy_metadata=allow_legacy_metadata,
+                sessionless_window_hours=sessionless_window_hours,
+                sessionless_partitioning=sessionless_partitioning,
                 observed=observed,
                 errors=errors,
             )
@@ -459,6 +532,8 @@ def _validate_manifest_file(
     file_index: int,
     kind: str | None,
     allow_legacy_metadata: bool,
+    sessionless_window_hours: int = 0,
+    sessionless_partitioning: str | None = None,
 ) -> tuple[_Observed, _ErrorCollector]:
     """Validate one manifest object in isolation for bounded parallelism."""
 
@@ -486,6 +561,8 @@ def _validate_manifest_file(
         file_index=file_index,
         relative_path=entry.path,
         allow_legacy_metadata=allow_legacy_metadata,
+        sessionless_window_hours=sessionless_window_hours,
+        sessionless_partitioning=sessionless_partitioning,
         observed=observed,
         errors=errors,
     )
@@ -506,6 +583,8 @@ def _validate_jsonl_row(
     line_no: int,
     relative_path: str,
     allow_legacy_metadata: bool,
+    sessionless_window_hours: int = 0,
+    sessionless_partitioning: str | None = None,
     observed: _Observed,
     errors: _ErrorCollector,
 ) -> None:
@@ -532,6 +611,8 @@ def _validate_jsonl_row(
         line_no=line_no,
         relative_path=relative_path,
         allow_legacy_metadata=allow_legacy_metadata,
+        sessionless_window_hours=sessionless_window_hours,
+        sessionless_partitioning=sessionless_partitioning,
         observed=observed,
         errors=errors,
     )
@@ -722,6 +803,8 @@ def validate_output_backend(
                 "trajfoundry-v2",
                 "trajfoundry-v3",
             },
+            sessionless_window_hours=manifest.sessionless_window_hours or 0,
+            sessionless_partitioning=manifest.sessionless_partitioning,
         )
 
     def log_progress(*, force: bool = False) -> None:

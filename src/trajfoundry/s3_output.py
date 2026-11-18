@@ -12,6 +12,8 @@ from typing import Any, Literal, Self
 
 from .canonical import trajectory_id
 from .export import SCHEMA_VERSION, ExportStats, trajectory_filename
+from .feedback import feedback_fields, unix_ms
+from .identity import normalize_session_id
 from .json_codec import dumps
 from .models import QuarantineRecord, TrajectoryNode
 from .output_contract import project_trajectory
@@ -204,6 +206,7 @@ class S3OutputSet:
         if max_pending is not None and max_pending <= 0:
             raise ValueError("max pending must be positive")
         self.max_shard_bytes = max_shard_bytes
+        self._started_at_ms = unix_ms()
         self._client = client
         self.location = location
         self.max_workers = max_workers
@@ -212,6 +215,8 @@ class S3OutputSet:
         self._trajectory_names: set[str] = set()
         self._lineage = _S3ObjectWriter(client, location, "lineage.jsonl")
         self.stats = ExportStats()
+        self._has_chunked_sessionless = False
+        self._has_unchunked_sessionless = False
         self._manifest_bytes: bytes | None = None
         self._aborted = False
         self._executor: ThreadPoolExecutor | None = (
@@ -307,6 +312,19 @@ class S3OutputSet:
     ) -> str:
         projected = project_trajectory(node)
         validate_derived_fields(node)
+        pending_nodes = [node]
+        chunked = self._has_chunked_sessionless
+        unchunked = self._has_unchunked_sessionless
+        while pending_nodes:
+            current = pending_nodes.pop()
+            if not normalize_session_id(current.metadata.session_id):
+                chunked |= bool(current.metadata.sessionless_chunk_id)
+                unchunked |= not current.metadata.sessionless_chunk_id
+            pending_nodes.extend((current.sub_agent_trajectory or {}).values())
+        if chunked and unchunked:
+            raise ValueError("cannot mix chunked and unchunked sessionless identities")
+        self._has_chunked_sessionless = chunked
+        self._has_unchunked_sessionless = unchunked
         identifier = trajectory_id(node)
         filename = trajectory_filename(node, identifier)
         if filename in self._trajectory_names:
@@ -375,6 +393,8 @@ class S3OutputSet:
         *,
         input_root: str,
         config_hash: str,
+        started_at_ms: int | None = None,
+        parse_failure_count: int = 0,
         input_format: Literal[
             "freerouter", "tokenplan", "sxf", "deepinfra"
         ] = "freerouter",
@@ -393,6 +413,14 @@ class S3OutputSet:
             raise
 
         manifest = {
+            **feedback_fields(
+                self.stats,
+                total_bytes=sum(item.bytes for item in self._trajectory_objects),
+                started_at_ms=(
+                    self._started_at_ms if started_at_ms is None else started_at_ms
+                ),
+                parse_failure_count=parse_failure_count,
+            ),
             "schema_version": SCHEMA_VERSION,
             "created_at": datetime.now(UTC).isoformat(),
             "input_root": input_root,
@@ -408,6 +436,8 @@ class S3OutputSet:
             },
             "files": [item.manifest_entry() for item in self.written_objects],
         }
+        if self._has_chunked_sessionless:
+            manifest["sessionless_partitioning"] = "normalized-bytes-v1"
         self._manifest_bytes = dumps(manifest, sort_keys=True, indent=2)
         return self._manifest_bytes
 

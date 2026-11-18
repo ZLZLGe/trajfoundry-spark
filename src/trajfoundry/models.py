@@ -16,6 +16,8 @@ from pydantic import (
     model_validator,
 )
 
+from .identity import normalize_session_id
+
 _REDACTED = "[REDACTED]"
 _CREDENTIAL_KEY = r"""
     (?:
@@ -30,7 +32,9 @@ _QUOTED_CREDENTIAL = re.compile(
 )
 _UNQUOTED_CREDENTIAL = re.compile(
     rf"(?ix)(?P<prefix>[\"']?{_CREDENTIAL_KEY}[\"']?\s*[:=]\s*)"
-    r"[^,;\r\n}\]]+"
+    # Consume an existing marker in full, including its closing bracket.
+    # Still consume adjacent values: a marker must not bypass new secrets.
+    r"(?:\[REDACTED\]|[^,;\r\n}\]])+"
 )
 _AUTH_SCHEME = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=:-]+")
 _CREDENTIAL_URL = re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@")
@@ -53,12 +57,26 @@ def _redact_ip(match: re.Match[str]) -> str:
 
 
 def sanitize_diagnostic_detail(detail: str) -> str:
-    """Remove credentials and network identifiers from non-trajectory text.
+    """Canonically redact credentials and network identifiers in diagnostics.
 
     This function is intentionally scoped to audit diagnostics. Message bodies,
     reasoning, tool arguments, and tool results never pass through it.
+    Revalidation after JSON round trips must leave the result unchanged.
     """
 
+    value = detail
+    while True:
+        sanitized = _sanitize_diagnostic_detail_once(value)
+        if sanitized == value:
+            return sanitized
+        # Truncation can turn a partial token into a newly recognizable IP or
+        # credential. Settle these boundary effects before publishing a detail.
+        # Replacements remove original content; after the first pass the string
+        # is also bounded by the detail limit plus its truncation marker.
+        value = sanitized
+
+
+def _sanitize_diagnostic_detail_once(detail: str) -> str:
     value = _AUTH_SCHEME.sub(lambda match: f"{match.group(1)} {_REDACTED}", detail)
     value = _CREDENTIAL_URL.sub(rf"\1{_REDACTED}@", value)
     value = _QUOTED_CREDENTIAL.sub(
@@ -240,15 +258,17 @@ class ToolCallCheck(StrictModel):
 
 class Metadata(StrictModel):
     source_file: str
-    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter"
     line_no: int = 0
     created_at: str = ""
     model: str = ""
     user_id: str = ""
+    end_user_id: str = ""
     session_id: str = ""
+    sessionless_chunk_id: str = ""
     sub_session_id: int = Field(default=0, ge=0)
     source_type: Literal["api-router", "traj-cooperate"] = "api-router"
-    specific_source: Literal["free-router", "token-plan", "SXF", "deep-infra"] = (
+    specific_source: Literal["free-router", "token-plan", "SXF", "deep-infra", "boyue-rich"] = (
         "free-router"
     )
 
@@ -284,6 +304,7 @@ class TrajectoryNode(StrictModel):
     source: str
     total_rounds: int = 0
     total_tool_calls: int = 0
+    total_tokens: int = Field(default=0, ge=0)
     tool_counts: dict[str, int] = Field(default_factory=dict)
     reasoning_total_tokens: int = 0
     tool_defs_tag: Literal["complete", "incomplete", "complete_with_incomplete_sub"] = (
@@ -317,8 +338,10 @@ class TrajectoryNode(StrictModel):
 class Snapshot(StrictModel):
     source_path: str
     source_sha256: str
-    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra", "boyue"] = "freerouter"
     session_id: str
+    # Assigned by Spark's byte-balanced planner, never inferred from payload.
+    sessionless_chunk_id: str = ""
     thread_id: str
     turn_id: str = ""
     parent_thread_id: str = ""
@@ -334,6 +357,7 @@ class Snapshot(StrictModel):
     request_id: str = ""
     model: str = ""
     user_id: str = ""
+    end_user_id: str = ""
     harness: str = "unknown"
     instructions: str = ""
     multimodal_file_mapping: list[MediaMapping] = Field(default_factory=list)
@@ -346,6 +370,13 @@ class Snapshot(StrictModel):
     termination: str = ""
     wire_complete: bool = False
     issues: list[AuditIssue] = Field(default_factory=list)
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def normalize_session(cls, value: Any) -> Any:
+        # Only normalize the string sentinel; invalid types must still fail
+        # strict validation instead of silently becoming a missing identity.
+        return normalize_session_id(value) if isinstance(value, str) else value
 
 
 class QuarantineRecord(StrictModel):

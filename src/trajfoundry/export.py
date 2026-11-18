@@ -14,6 +14,8 @@ from typing import Any, Literal, Self
 import orjson
 
 from .canonical import trajectory_id
+from .feedback import feedback_fields, unix_ms
+from .identity import normalize_session_id
 from .io import file_sha256
 from .json_codec import dumps, loads
 from .models import QuarantineRecord, TrajectoryNode
@@ -22,8 +24,18 @@ from .quality import is_strict_sample, validate_derived_fields
 
 SCHEMA_VERSION = "trajfoundry-v4"
 
-_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SYNTHESIZED_SESSION_CODE = "metadata_session_id_synthesized"
+_SESSION_FILENAME_MARKER = "badsession_"
+_SESSIONLESS_FILENAME_MARKER = "no_session_id_"
+_SAFE_SESSION_FILENAME_MARKER = "_safe_session_"
+_LONG_SESSION_FILENAME_MARKER = "_longsession_"
+_SESSION_FILENAME_SUFFIX = re.compile(r"_sub_([0-9]+)\.jsonl$")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_HEX_BYTE_VALUES = frozenset(b"0123456789abcdefABCDEF")
+_SAFE_SESSION_FILENAME_BYTES = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+)
 
 
 @dataclass
@@ -50,12 +62,171 @@ class ExportStats:
 
 
 def _session_was_synthesized(node: TrajectoryNode) -> bool:
-    if not node.metadata.session_id:
+    if not node.metadata.session_id or node.metadata.sessionless_chunk_id:
         return True
     audit = node.normalization_audit
     return bool(
         audit and any(issue.code == _SYNTHESIZED_SESSION_CODE for issue in audit.issues)
     )
+
+
+def _encode_session_filename_component(session_id: str) -> str:
+    """Encode an arbitrary session ID into one reversible flat-name component.
+
+    Safe ASCII bytes remain readable.  Every other UTF-8 byte is represented
+    as ``_xHH_``.  An underscore that would otherwise start such a token is
+    itself escaped, which prevents a literal value such as ``"_x7B_"`` from
+    being confused with an encoded ``"{"``.  The result is ASCII-only and
+    therefore cannot introduce path separators, control characters, or a
+    platform-specific Unicode normalization issue.
+    """
+
+    encoded: list[str] = []
+    raw = session_id.encode("utf-8")
+    for index, byte in enumerate(raw):
+        if byte not in _SAFE_SESSION_FILENAME_BYTES:
+            encoded.append(f"_x{byte:02X}_")
+            continue
+        if byte == ord("_"):
+            # Keep ordinary underscores readable, but escape one that would
+            # form the beginning of a decoder token with the following bytes.
+            lookahead = raw[index + 1 : index + 5]
+            if (
+                len(lookahead) >= 3
+                and lookahead[0] == ord("x")
+                and lookahead[1] in _HEX_BYTE_VALUES
+                and lookahead[2] in _HEX_BYTE_VALUES
+                and (len(lookahead) == 3 or lookahead[3] == ord("_"))
+            ):
+                encoded.append("_x5F_")
+                continue
+        encoded.append(chr(byte))
+    return "".join(encoded)
+
+
+def _decode_session_filename_component(encoded: str) -> str:
+    """Inverse of :func:`_encode_session_filename_component`."""
+
+    raw = bytearray()
+    index = 0
+    while index < len(encoded):
+        if (
+            encoded[index] == "_"
+            and index + 4 < len(encoded)
+            and encoded[index + 1] == "x"
+            and encoded[index + 2] in _HEX_DIGITS
+            and encoded[index + 3] in _HEX_DIGITS
+            and encoded[index + 4] == "_"
+        ):
+            raw.append(int(encoded[index + 2 : index + 4], 16))
+            index += 5
+            continue
+        character = encoded[index]
+        if ord(character) > 0x7F:
+            raise ValueError("session filename encoding must be ASCII")
+        raw.append(ord(character))
+        index += 1
+    try:
+        return bytes(raw).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("session filename contains invalid UTF-8 escapes") from error
+
+
+def _escaped_session_filename(
+    session_id: str,
+    sub_session_id: int,
+    *,
+    marker: str = _SESSION_FILENAME_MARKER,
+) -> str:
+    encoded = _encode_session_filename_component(session_id)
+    # Keep a dedicated separator before ``sub``.  Although an escape token
+    # also ends in ``_``, retaining this separator makes the filename grammar
+    # unambiguous for literal values that happen to end in ``_xHH``.
+    return f"{marker}{encoded}_sub_{sub_session_id}.jsonl"
+
+
+def session_filename(session_id: str, sub_session_id: int) -> str:
+    """Return a deterministic flat filename for a real session identity.
+
+    Existing short, safe IDs retain their exact filenames for backwards
+    compatibility.  Unsafe IDs use a ``badsession_`` marker and a reversible
+    UTF-8 byte escape (for example, ``bad/session`` becomes
+    ``badsession_bad_x2F_session_sub_0.jsonl``).  No digest or lossy
+    sanitization is used, so the original ID can be recovered from the name.
+    The rare safe ID beginning with the reserved ``badsession_`` marker uses
+    a leading-underscore escape marker to keep decoding unambiguous.
+    Encoding imposes no application-level length limit; the destination's
+    filename or complete object-key limits still apply.
+    """
+
+    if type(sub_session_id) is not int or sub_session_id < 0:
+        raise ValueError("sub_session_id must be a non-negative integer")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id must be a non-empty string")
+    if _SAFE_SESSION_ID.fullmatch(session_id):
+        filename = f"{session_id}_sub_{sub_session_id}.jsonl"
+        if not session_id.startswith(
+            (_SESSION_FILENAME_MARKER, _SESSIONLESS_FILENAME_MARKER)
+        ):
+            return filename
+        return _escaped_session_filename(
+            session_id, sub_session_id, marker=_SAFE_SESSION_FILENAME_MARKER
+        )
+    return _escaped_session_filename(session_id, sub_session_id)
+
+
+def decode_session_filename(filename: str) -> tuple[str, int]:
+    """Recover a real ``(session_id, sub_session_id)`` from a trajectory name.
+
+    Safe historical names are returned directly.  ``badsession_``,
+    ``_safe_session_``, and ``_longsession_`` names are decoded from their
+    UTF-8 byte escapes.  A ``no_session_id_`` name has no real session
+    identity and is rejected.
+    """
+
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(char) < 32 or ord(char) == 127 for char in filename)
+    ):
+        raise ValueError("trajectory filename must be a safe flat filename")
+    match = _SESSION_FILENAME_SUFFIX.search(filename)
+    if match is None:
+        raise ValueError("trajectory filename has no valid sub_session_id suffix")
+    sub_session_id = int(match.group(1))
+    stem = filename[: match.start()]
+    if stem.startswith(_SESSIONLESS_FILENAME_MARKER):
+        raise ValueError("sessionless trajectory filename has no real session_id")
+    if stem.startswith(_SESSION_FILENAME_MARKER):
+        encoded = stem[len(_SESSION_FILENAME_MARKER) :]
+        if not encoded:
+            raise ValueError("badsession filename has an empty session_id")
+        session_id = _decode_session_filename_component(encoded)
+        if _SAFE_SESSION_ID.fullmatch(session_id):
+            raise ValueError("badsession filename contains a safe session_id")
+    elif stem.startswith(_SAFE_SESSION_FILENAME_MARKER):
+        encoded = stem[len(_SAFE_SESSION_FILENAME_MARKER) :]
+        if not encoded:
+            raise ValueError("safe-session filename has an empty session_id")
+        session_id = _decode_session_filename_component(encoded)
+        if _SAFE_SESSION_ID.fullmatch(session_id) is None:
+            raise ValueError("safe-session filename contains an unsafe session_id")
+    elif stem.startswith(_LONG_SESSION_FILENAME_MARKER):
+        encoded = stem[len(_LONG_SESSION_FILENAME_MARKER) :]
+        if not encoded:
+            raise ValueError("longsession filename has an empty session_id")
+        session_id = _decode_session_filename_component(encoded)
+        if not _SAFE_SESSION_ID.fullmatch(session_id):
+            raise ValueError("longsession filename contains an unsafe session_id")
+    else:
+        session_id = stem
+        if _SAFE_SESSION_ID.fullmatch(session_id) is None:
+            raise ValueError("trajectory filename contains an invalid session_id")
+    if not session_id:
+        raise ValueError("trajectory filename has an empty session_id")
+    return session_id, sub_session_id
 
 
 def trajectory_filename(node: TrajectoryNode, identifier: str | None = None) -> str:
@@ -72,13 +243,7 @@ def trajectory_filename(node: TrajectoryNode, identifier: str | None = None) -> 
             raise ValueError("trajectory identifier must be a sha256 digest")
         return f"no_session_id_{digest}_sub_0.jsonl"
 
-    session_id = node.metadata.session_id
-    if not _SAFE_SESSION_ID.fullmatch(session_id):
-        raise ValueError(
-            "session_id must contain only ASCII letters, digits, '.', '_' or '-' "
-            "and must be at most 200 characters"
-        )
-    return f"{session_id}_sub_{sub_session_id}.jsonl"
+    return session_filename(node.metadata.session_id, sub_session_id)
 
 
 def _manifest_paths(root: Path) -> set[str]:
@@ -178,6 +343,7 @@ class OutputSet:
         if max_shard_bytes <= 0:
             raise ValueError("max shard bytes must be positive")
         self.max_shard_bytes = max_shard_bytes
+        self._started_at_ms = unix_ms()
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         # Remove leftovers from an interrupted/failed publication before any
@@ -202,6 +368,8 @@ class OutputSet:
         self._lineage_tmp = self._stage / "lineage.jsonl.tmp"
         self._lineage = self._lineage_tmp.open("wb")
         self.stats = ExportStats()
+        self._has_chunked_sessionless = False
+        self._has_unchunked_sessionless = False
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -216,6 +384,19 @@ class OutputSet:
     ) -> str:
         projected = project_trajectory(node)
         validate_derived_fields(node)
+        pending_nodes = [node]
+        chunked = self._has_chunked_sessionless
+        unchunked = self._has_unchunked_sessionless
+        while pending_nodes:
+            current = pending_nodes.pop()
+            if not normalize_session_id(current.metadata.session_id):
+                chunked |= bool(current.metadata.sessionless_chunk_id)
+                unchunked |= not current.metadata.sessionless_chunk_id
+            pending_nodes.extend((current.sub_agent_trajectory or {}).values())
+        if chunked and unchunked:
+            raise ValueError("cannot mix chunked and unchunked sessionless identities")
+        self._has_chunked_sessionless = chunked
+        self._has_unchunked_sessionless = unchunked
         identifier = trajectory_id(node)
         filename = trajectory_filename(node, identifier)
         if filename in self._trajectory_names:
@@ -275,6 +456,8 @@ class OutputSet:
         *,
         input_root: str,
         config_hash: str,
+        started_at_ms: int | None = None,
+        parse_failure_count: int = 0,
         input_format: Literal[
             "freerouter", "tokenplan", "sxf", "deepinfra"
         ] = "freerouter",
@@ -313,6 +496,22 @@ class OutputSet:
                 for path in files
             ],
         }
+        if self._has_chunked_sessionless:
+            manifest["sessionless_partitioning"] = "normalized-bytes-v1"
+        manifest.update(
+            feedback_fields(
+                self.stats,
+                total_bytes=sum(
+                    item["bytes"]
+                    for item in manifest["files"]
+                    if item["path"] != "lineage.jsonl"
+                ),
+                started_at_ms=self._started_at_ms
+                if started_at_ms is None
+                else started_at_ms,
+                parse_failure_count=parse_failure_count,
+            )
+        )
         manifest_bytes = dumps(manifest, sort_keys=True, indent=2)
         with self._manifest_tmp.open("wb") as handle:
             handle.write(manifest_bytes)
@@ -365,5 +564,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "ExportStats",
     "OutputSet",
+    "decode_session_filename",
+    "session_filename",
     "trajectory_filename",
 ]

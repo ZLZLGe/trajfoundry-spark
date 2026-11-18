@@ -10,9 +10,12 @@ diagnostics.
 from __future__ import annotations
 
 import json
+import sys
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from heapq import merge
+from itertools import groupby
 from typing import Any
 
 from .audit_codes import MountDiagnosticCode
@@ -49,6 +52,53 @@ class MountDiagnostic:
     session_id: str = ""
     spawn_call_name: str = ""
     spawn_arguments_json: str = ""
+
+
+class SubagentPlanLimitError(RuntimeError):
+    """The exact planner cannot fit its admitted derived metadata."""
+
+
+@dataclass(slots=True)
+class _DiagnosticBudget:
+    """Charge each diagnostic once, before any helper retains it in a list.
+
+    The fixed allowance covers the record and list/sort/tuple references;
+    string sizes include Python's Unicode storage. Shared target tuples have
+    separate admission and must not be charged or traversed per diagnostic.
+    This is a conservative working-set estimate, not an absolute RSS limit.
+    """
+
+    max_bytes: int
+    used: int = 0
+
+    def make(
+        self, *, code: MountDiagnosticCode, detail: str, **fields: Any
+    ) -> MountDiagnostic:
+        diagnostic = MountDiagnostic(code=code, detail=detail, **fields)
+        projected = (
+            self.used
+            + 512
+            + sum(
+                sys.getsizeof(value)
+                for value in (
+                    diagnostic.code,
+                    diagnostic.detail,
+                    diagnostic.parent_thread_id,
+                    diagnostic.parent_turn_id,
+                    diagnostic.spawn_call_id,
+                    diagnostic.session_id,
+                    diagnostic.spawn_call_name,
+                    diagnostic.spawn_arguments_json,
+                )
+            )
+        )
+        if projected > self.max_bytes:
+            raise SubagentPlanLimitError(
+                f"subagent planner diagnostics need {projected} estimated bytes; "
+                f"limit={self.max_bytes}; no partial plan was produced"
+            )
+        self.used = projected
+        return diagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +434,8 @@ def _agent_message_signature(record: Any) -> str:
 def _agent_message_index(
     canonical_leaves: Sequence[Snapshot],
     evidence_source: Sequence[Snapshot],
+    *,
+    diagnostic_budget: _DiagnosticBudget | None = None,
 ) -> tuple[
     dict[tuple[str, str], tuple[Any, ...]],
     set[tuple[str, str, str]],
@@ -391,6 +443,7 @@ def _agent_message_index(
 ]:
     """Deduplicate cumulative replays and reject ambiguous message ids."""
 
+    make_diagnostic = diagnostic_budget.make if diagnostic_budget else MountDiagnostic
     variants: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(dict)
     duplicate_ids: set[tuple[str, str, str]] = set()
     for snapshot in sorted(evidence_source, key=_leaf_key):
@@ -422,37 +475,40 @@ def _agent_message_index(
     for records in records_by_thread.values():
         records.sort(key=lambda record: (record.origin, record.item_index))
 
+    # All conflicting ids in a thread affect the same leaves. Build that
+    # target tuple once: repeating both the scan and the tuple for every id
+    # otherwise costs O(conflicting ids * thread leaves) resident memory.
+    blocked_threads = {key[:2] for key in blocked_ids}
+    target_lists: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, leaf in enumerate(canonical_leaves):
+        thread_key = leaf.session_id, leaf.thread_id
+        if thread_key in blocked_threads:
+            target_lists[thread_key].append(index)
+    targets_by_thread = {key: tuple(values) for key, values in target_lists.items()}
+    del target_lists
     diagnostics: list[MountDiagnostic] = []
     for key in sorted(duplicate_ids):
         session_id, thread_id, message_id = key
-        targets = [
-            index
-            for index, leaf in enumerate(canonical_leaves)
-            if (leaf.session_id, leaf.thread_id) == (session_id, thread_id)
-        ]
+        targets = targets_by_thread.get((session_id, thread_id), ())
         diagnostics.append(
-            MountDiagnostic(
+            make_diagnostic(
                 code="duplicate_agent_message_id",
                 detail=f"agent_message id {message_id!r} occurs more than once",
                 leaf_index=targets[0] if len(targets) == 1 else None,
-                related_leaf_indices=tuple(targets) if len(targets) > 1 else (),
+                related_leaf_indices=targets if len(targets) > 1 else (),
                 parent_thread_id=thread_id,
                 session_id=session_id,
             )
         )
     for key in sorted(conflict_ids):
         session_id, thread_id, message_id = key
-        targets = [
-            index
-            for index, leaf in enumerate(canonical_leaves)
-            if (leaf.session_id, leaf.thread_id) == (session_id, thread_id)
-        ]
+        targets = targets_by_thread.get((session_id, thread_id), ())
         diagnostics.append(
-            MountDiagnostic(
+            make_diagnostic(
                 code="conflicting_agent_message_evidence",
                 detail=f"agent_message id {message_id!r} has conflicting raw items",
                 leaf_index=targets[0] if len(targets) == 1 else None,
-                related_leaf_indices=tuple(targets) if len(targets) > 1 else (),
+                related_leaf_indices=targets if len(targets) > 1 else (),
                 parent_thread_id=thread_id,
                 session_id=session_id,
             )
@@ -476,6 +532,55 @@ def _contains_spawn(snapshot: Snapshot, evidence: SpawnEvidence) -> bool:
         if _canonical_json(arguments) == evidence.arguments_json:
             return True
     return False
+
+
+def _spawn_parent_index(
+    leaves: Sequence[Snapshot], *, max_bytes: int
+) -> dict[tuple[str, str, str, str | None], list[int]] | None:
+    """Bounded exact reverse lookup for the existing _contains_spawn predicate.
+
+    Neither function name nor turn id is a matching condition there. Malformed
+    repeated arguments remain a wildcard for the call id within its thread.
+    If this cache cannot fit, discard it completely and retain the old scan;
+    a partial index must never change missing/ambiguous-parent diagnostics.
+    """
+    if max_bytes <= 0:
+        return None
+    lookup: dict[tuple[str, str, str, str | None], list[int]] = {}
+    used = 0
+    for index, leaf in enumerate(leaves):
+        for call in _spawn_calls((*leaf.history, *leaf.response)):
+            arguments, malformed = _as_object(call.function.arguments)
+            signature = (
+                None if malformed or arguments is None else _canonical_json(arguments)
+            )
+            key = leaf.session_id, leaf.thread_id, call.id, signature
+            values = lookup.get(key)
+            if values is None:
+                # Include conservative dict/tuple/list headers and index slots.
+                used += 512 + sum(
+                    len(value.encode("utf-8")) for value in key if value is not None
+                )
+                if used > max_bytes:
+                    return None
+                values = lookup[key] = []
+            if not values or values[-1] != index:
+                used += 40
+                if used > max_bytes:
+                    return None
+                values.append(index)
+    return lookup
+
+
+def _indexed_spawn_candidates(
+    lookup: dict[tuple[str, str, str, str | None], list[int]], evidence: SpawnEvidence
+) -> list[int]:
+    prefix = evidence.session_id, evidence.parent_thread_id, evidence.spawn_call_id
+    exact = lookup.get((*prefix, evidence.arguments_json), ())
+    wildcard = lookup.get((*prefix, None), ())
+    # Lists follow canonical leaf order already; merge without allocating a
+    # second leaf-sized set and preserve the scan's unique sorted indices.
+    return [index for index, _ in groupby(merge(exact, wildcard))]
 
 
 def _is_subagent(snapshot: Snapshot) -> bool:
@@ -570,7 +675,10 @@ def _diagnostic_sort_key(diagnostic: MountDiagnostic) -> tuple[Any, ...]:
 
 def _extract_spawn_evidence(
     snapshots: Sequence[Snapshot],
+    *,
+    diagnostic_budget: _DiagnosticBudget | None = None,
 ) -> tuple[tuple[SpawnEvidence, ...], list[MountDiagnostic]]:
+    make_diagnostic = diagnostic_budget.make if diagnostic_budget else MountDiagnostic
     diagnostics: list[MountDiagnostic] = []
     by_key: dict[tuple[str, str, str, str], SpawnEvidence] = {}
     conflicts: set[tuple[str, str, str, str]] = set()
@@ -583,7 +691,7 @@ def _extract_spawn_evidence(
             for call in calls:
                 call_name, call_arguments_json = _spawn_call_signature(call)
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="spawn_missing_turn_id",
                         detail=(
                             f"spawn call {call.id!r} in {snapshot.source_path!r} "
@@ -601,7 +709,7 @@ def _extract_spawn_evidence(
             call_name, call_arguments_json = _spawn_call_signature(call)
             if not call.id:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="spawn_missing_call_id",
                         detail=f"spawn response in {snapshot.source_path!r} has no call id",
                         parent_thread_id=snapshot.thread_id,
@@ -615,7 +723,7 @@ def _extract_spawn_evidence(
             arguments, malformed = _as_object(call.function.arguments)
             if malformed or arguments is None:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="malformed_spawn_arguments",
                         detail=f"spawn call {call.id!r} arguments are not a JSON object",
                         parent_thread_id=snapshot.thread_id,
@@ -639,7 +747,7 @@ def _extract_spawn_evidence(
             if len(canonical_names) > 1 and result_key not in reported_result_conflicts:
                 reported_result_conflicts.add(result_key)
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="conflicting_spawn_agent_name",
                         detail=(
                             "spawn_agent result replays contain conflicting "
@@ -681,7 +789,7 @@ def _extract_spawn_evidence(
     for key in sorted(conflicts):
         event = by_key.pop(key)
         diagnostics.append(
-            MountDiagnostic(
+            make_diagnostic(
                 code="conflicting_spawn_evidence",
                 detail="the same turn/call id has conflicting structured arguments",
                 parent_thread_id=event.parent_thread_id,
@@ -710,13 +818,18 @@ def _extract_spawn_evidence(
 
 
 def _validate_child(
-    snapshot: Snapshot, marker: _RoutingMarker, leaf_index: int
+    snapshot: Snapshot,
+    marker: _RoutingMarker,
+    leaf_index: int,
+    *,
+    diagnostic_budget: _DiagnosticBudget | None = None,
 ) -> list[MountDiagnostic]:
+    make_diagnostic = diagnostic_budget.make if diagnostic_budget else MountDiagnostic
     diagnostics: list[MountDiagnostic] = []
 
     def add(code: MountDiagnosticCode, detail: str) -> None:
         diagnostics.append(
-            MountDiagnostic(
+            make_diagnostic(
                 code=code,
                 detail=detail,
                 leaf_index=leaf_index,
@@ -812,9 +925,12 @@ def _attach_relay_ids(
     edges: Sequence[MountEdge],
     leaves: Sequence[Snapshot],
     agent_records_by_thread: Mapping[tuple[str, str], Sequence[AgentMessageRecord]],
+    *,
+    diagnostic_budget: _DiagnosticBudget | None = None,
 ) -> tuple[list[MountEdge], list[MountDiagnostic]]:
     """Attach a relay only after its unique spawn call/result pair completes."""
 
+    make_diagnostic = diagnostic_budget.make if diagnostic_budget else MountDiagnostic
     diagnostics: list[MountDiagnostic] = []
     by_parent: dict[int, list[MountEdge]] = defaultdict(list)
     for edge in edges:
@@ -851,7 +967,7 @@ def _attach_relay_ids(
             )
             if conflicting_child_agent_name:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="conflicting_child_agent_name",
                         detail=(
                             "sub-agent thread has multiple structured recipient "
@@ -867,7 +983,7 @@ def _attach_relay_ids(
                 continue
             if not child_agent_name:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="missing_child_agent_name",
                         detail=(
                             "spawn_agent has a canonical result name but the child "
@@ -884,7 +1000,7 @@ def _attach_relay_ids(
                 continue
             if child_agent_name != edge.agent_name:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="conflicting_child_agent_name",
                         detail=(
                             "child agent_message recipient does not match the "
@@ -922,7 +1038,7 @@ def _attach_relay_ids(
                 and known_spawns.intersection(record.preceding_completed_spawn_call_ids)
             ):
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="unmatched_agent_message",
                         detail=(
                             f"agent_message id {_agent_field(record, 'id')!r} "
@@ -954,7 +1070,7 @@ def _attach_relay_ids(
             ]
             if author_matches and not recipient_matches:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="agent_relay_recipient_mismatch",
                         detail=(
                             "agent_message author matches the child but recipient "
@@ -976,7 +1092,7 @@ def _attach_relay_ids(
             ]
             if recipient_matches and not ordered:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="agent_relay_before_spawn",
                         detail=(
                             "matching agent_message has no structured evidence "
@@ -993,7 +1109,7 @@ def _attach_relay_ids(
                 continue
             if len(ordered) > 1:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="ambiguous_agent_relay",
                         detail=(
                             "multiple ordered agent_message records match the "
@@ -1014,7 +1130,7 @@ def _attach_relay_ids(
             relay_id = _agent_field(ordered[0], "id")
             if relay_id == edge.spawn_call_id:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="relay_id_conflict",
                         detail="agent_message relay id equals its spawn call id",
                         leaf_index=parent_index,
@@ -1041,7 +1157,7 @@ def _attach_relay_ids(
         }
         for (parent_index, relay_id), values in sorted(conflicts.items()):
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="relay_id_conflict",
                     detail=(
                         f"agent_message relay id {relay_id!r} matches multiple "
@@ -1092,6 +1208,9 @@ def plan_subagent_mounts(
     leaves: Sequence[Snapshot],
     *,
     all_snapshots: Sequence[Snapshot] | None = None,
+    parent_index_max_bytes: int = 32 * 1024 * 1024,
+    diagnostic_target_max_bytes: int | None = None,
+    diagnostic_max_bytes: int | None = None,
 ) -> SubagentMountPlan:
     """Build an auditable mount plan without mutating trajectory nodes.
 
@@ -1099,15 +1218,28 @@ def plan_subagent_mounts(
     stage.  Pass the pre-aggregation collection as ``all_snapshots`` so spawn
     calls can remain bound to their original ``turn_id`` even when that turn's
     snapshot was removed as an intermediate.
+
+    An explicit ``diagnostic_max_bytes`` bounds estimated retained diagnostic
+    metadata across all planning helpers. It does not cap total process RSS.
     """
 
+    diagnostic_budget = (
+        _DiagnosticBudget(diagnostic_max_bytes)
+        if diagnostic_max_bytes is not None
+        else None
+    )
+    make_diagnostic = diagnostic_budget.make if diagnostic_budget else MountDiagnostic
     canonical_leaves = tuple(sorted(leaves, key=_leaf_key))
     evidence_source = (
         tuple(all_snapshots) if all_snapshots is not None else canonical_leaves
     )
-    events, diagnostics = _extract_spawn_evidence(evidence_source)
+    events, diagnostics = _extract_spawn_evidence(
+        evidence_source, diagnostic_budget=diagnostic_budget
+    )
     agent_records_by_thread, _blocked_agent_ids, agent_diagnostics = (
-        _agent_message_index(canonical_leaves, evidence_source)
+        _agent_message_index(
+            canonical_leaves, evidence_source, diagnostic_budget=diagnostic_budget
+        )
     )
     diagnostics.extend(agent_diagnostics)
 
@@ -1120,21 +1252,55 @@ def plan_subagent_mounts(
     parent_for_event: dict[tuple[str, str, str, str], int] = {}
     parent_linkage_incomplete: set[int] = set()
     spawn_call_counts = [0] * len(canonical_leaves)
+    spawn_parent_index = (
+        _spawn_parent_index(canonical_leaves, max_bytes=parent_index_max_bytes)
+        if events
+        else {}
+    )
+    # Turn and tool name are intentionally absent: _contains_spawn does not
+    # compare either field. Replayed events across many turns must share the
+    # same immutable candidate tuple, including when the reverse index did
+    # not fit and parent lookup falls back to the exact historical scan.
+    candidate_cache: dict[tuple[str, str, str, str], tuple[int, ...]] = {}
+    candidate_bytes = 0
+    ambiguous_multiplicity: dict[int, tuple[tuple[int, ...], int]] = {}
     for event in events:
-        candidates = [
-            index
-            for index in thread_leaves.get(
-                (
-                    event.session_id,
-                    event.parent_thread_id,
-                ),
-                (),
+        candidate_key = (
+            event.session_id,
+            event.parent_thread_id,
+            event.spawn_call_id,
+            event.arguments_json,
+        )
+        candidates = candidate_cache.get(candidate_key)
+        if candidates is None:
+            if spawn_parent_index is None:
+                found = [
+                    index
+                    for index in thread_leaves.get(
+                        (event.session_id, event.parent_thread_id), ()
+                    )
+                    if _contains_spawn(canonical_leaves[index], event)
+                ]
+            else:
+                found = _indexed_spawn_candidates(spawn_parent_index, event)
+            candidate_bytes += (
+                512
+                + len(found) * 40
+                + sum(len(value.encode("utf-8")) for value in candidate_key)
             )
-            if _contains_spawn(canonical_leaves[index], event)
-        ]
+            if (
+                diagnostic_target_max_bytes is not None
+                and candidate_bytes > diagnostic_target_max_bytes
+            ):
+                raise SubagentPlanLimitError(
+                    f"subagent candidate targets require {candidate_bytes} admitted bytes; "
+                    f"limit={diagnostic_target_max_bytes}; no partial plan was produced"
+                )
+            candidates = candidate_cache[candidate_key] = tuple(found)
+            del found
         if not candidates:
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="missing_parent_leaf",
                     detail="no maximal parent leaf contains the indexed spawn call",
                     parent_thread_id=event.parent_thread_id,
@@ -1146,14 +1312,19 @@ def plan_subagent_mounts(
                 )
             )
         elif len(candidates) > 1:
-            parent_linkage_incomplete.update(candidates)
-            for candidate in candidates:
-                spawn_call_counts[candidate] += 1
+            # Replayed turns can have identical broad ambiguity. Aggregate
+            # counts once per shared target tuple rather than repeatedly
+            # touching every leaf for each event; diagnostics stay per event.
+            previous = ambiguous_multiplicity.get(id(candidates))
+            ambiguous_multiplicity[id(candidates)] = (
+                candidates,
+                (previous[1] if previous else 0) + 1,
+            )
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="ambiguous_parent_leaf",
                     detail="multiple maximal parent branches contain the same spawn call",
-                    related_leaf_indices=tuple(candidates),
+                    related_leaf_indices=candidates,
                     parent_thread_id=event.parent_thread_id,
                     parent_turn_id=event.parent_turn_id,
                     spawn_call_id=event.spawn_call_id,
@@ -1165,6 +1336,16 @@ def plan_subagent_mounts(
         else:
             parent_for_event[event.key] = candidates[0]
             spawn_call_counts[candidates[0]] += 1
+
+    # The reverse lookup is only needed for parent binding, not for child
+    # validation, diagnostics, relay planning or materialization.
+    del spawn_parent_index
+    del candidate_cache
+    for candidates, multiplicity in ambiguous_multiplicity.values():
+        parent_linkage_incomplete.update(candidates)
+        for candidate in candidates:
+            spawn_call_counts[candidate] += multiplicity
+    del ambiguous_multiplicity
 
     events_by_turn: dict[tuple[str, str, str], list[SpawnEvidence]] = defaultdict(list)
     for event in events:
@@ -1213,7 +1394,7 @@ def plan_subagent_mounts(
                 else "conflicting_parent_thread"
             )
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code=code,
                     detail=(
                         f"sub-agent thread has inconsistent {field_name} values "
@@ -1247,7 +1428,7 @@ def plan_subagent_mounts(
             invalid_children.update(unselected)
             for index in unselected:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="unselected_child_branch",
                         detail=(
                             "a longer maximal leaf from the same sub-agent thread "
@@ -1265,7 +1446,9 @@ def plan_subagent_mounts(
     for child_index in sorted(subagent_indices):
         child = canonical_leaves[child_index]
         marker = _parse_routing_marker(child.subagent_marker)
-        child_diagnostics = _validate_child(child, marker, child_index)
+        child_diagnostics = _validate_child(
+            child, marker, child_index, diagnostic_budget=diagnostic_budget
+        )
         diagnostics.extend(child_diagnostics)
         if child_diagnostics or child_index in invalid_children:
             invalid_children.add(child_index)
@@ -1279,7 +1462,7 @@ def plan_subagent_mounts(
         candidates = list(events_by_turn.get(turn_key, ()))
         if not candidates:
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="missing_spawn_call",
                     detail="parent thread/turn has no indexed spawn_agent call",
                     leaf_index=child_index,
@@ -1315,7 +1498,7 @@ def plan_subagent_mounts(
 
         if not candidates:
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="spawn_routing_mismatch",
                     detail="structured child routing matches no spawn call on the parent turn",
                     leaf_index=child_index,
@@ -1337,7 +1520,7 @@ def plan_subagent_mounts(
         )
         if conflicting_recipient:
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="conflicting_child_agent_name",
                     detail=(
                         "sub-agent thread has multiple structured direct-child "
@@ -1362,7 +1545,7 @@ def plan_subagent_mounts(
             recipient_matches = _filter_spawns_by_recipient(candidates, recipient)
             if not recipient_matches:
                 diagnostics.append(
-                    MountDiagnostic(
+                    make_diagnostic(
                         code="spawn_routing_mismatch",
                         detail=(
                             "structured child recipient conflicts with the spawn "
@@ -1381,7 +1564,7 @@ def plan_subagent_mounts(
 
         if len(candidates) > 1:
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="ambiguous_spawn_call",
                     detail="parent turn contains multiple spawn calls and routing is not unique",
                     leaf_index=child_index,
@@ -1425,7 +1608,7 @@ def plan_subagent_mounts(
         invalid_children.update(related)
         for edge in grouped:
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="multiple_children_for_spawn",
                     detail="one spawn call is claimed by multiple child threads",
                     leaf_index=edge.child_index,
@@ -1439,13 +1622,14 @@ def plan_subagent_mounts(
 
     cycle_members = _cycle_nodes(edges)
     if cycle_members:
-        for index in sorted(cycle_members):
+        cycle_targets = tuple(sorted(cycle_members))
+        for index in cycle_targets:
             diagnostics.append(
-                MountDiagnostic(
+                make_diagnostic(
                     code="mount_cycle",
                     detail="sub-agent parentage forms a directed cycle",
                     leaf_index=index,
-                    related_leaf_indices=tuple(sorted(cycle_members)),
+                    related_leaf_indices=cycle_targets,
                     parent_thread_id=canonical_leaves[index].parent_thread_id,
                     parent_turn_id=canonical_leaves[index].parent_turn_id,
                     session_id=canonical_leaves[index].session_id,
@@ -1463,6 +1647,7 @@ def plan_subagent_mounts(
         edges,
         canonical_leaves,
         agent_records_by_thread,
+        diagnostic_budget=diagnostic_budget,
     )
     diagnostics.extend(relay_diagnostics)
 
@@ -1484,7 +1669,7 @@ def plan_subagent_mounts(
     unreachable = subagent_indices - reachable
     for index in sorted(unreachable - invalid_children):
         diagnostics.append(
-            MountDiagnostic(
+            make_diagnostic(
                 code="unreachable_subagent",
                 detail="valid local linkage does not lead to a main-agent root",
                 leaf_index=index,
@@ -1516,7 +1701,7 @@ def plan_subagent_mounts(
             continue
         incomplete_parents.add(parent_index)
         diagnostics.append(
-            MountDiagnostic(
+            make_diagnostic(
                 code="unmounted_spawn_call",
                 detail="indexed spawn call has no uniquely mounted child trajectory",
                 leaf_index=parent_index,

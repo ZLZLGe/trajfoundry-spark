@@ -33,6 +33,7 @@ from .classification.classifier import (
 from .classification.client import ChatCompletionsClient
 from .classification.taxonomy import DEFAULT_TAXONOMY_PATH, ScenarioTaxonomy
 from .credentials import DEFAULT_S3_CREDENTIALS_PATH, load_s3_credentials
+from .export import session_filename
 from .output_contract import parse_trajectory_record
 from .s3 import S3Location, create_s3_client, parse_s3_uri
 from .s3_validation import S3ValidationBackend
@@ -41,7 +42,6 @@ from .validation import validate_output_backend
 LOGGER = logging.getLogger(__name__)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FLAT_TRAJECTORY = re.compile(r"^.+_sub_[0-9]+\.jsonl$")
-_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _SYNTHESIZED_SESSION_CODE = "metadata_session_id_synthesized"
 _READ_CHUNK_BYTES = 1024 * 1024
 DEFAULT_CLASSIFIER_API_URL = "https://token.pjlab.org.cn/v1/chat/completions"
@@ -253,6 +253,9 @@ def _is_record_entry(entry: _ManifestEntry) -> bool:
 
 
 def _session_is_synthesized(value: dict[str, Any]) -> bool:
+    metadata = value.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("sessionless_chunk_id"):
+        return True
     audit = value.get("normalization_audit")
     if type(audit) is not dict:
         return False
@@ -292,6 +295,8 @@ def _stage_manifest_entry(
     entry: _ManifestEntry,
     stage_root: Path,
     start_order: int,
+    *,
+    sessionless_window_hours: int = 0,
 ) -> list[_StagedTrajectory]:
     response = client.get_object(
         Bucket=input_location.bucket,
@@ -350,7 +355,9 @@ def _stage_manifest_entry(
         staged.append(
             _StagedTrajectory(
                 path=staged_path,
-                stable_hash=trajectory_id(node),
+                stable_hash=trajectory_id(
+                    node, sessionless_window_hours=sessionless_window_hours
+                ),
                 session_id=session_id,
                 session_synthesized=_session_is_synthesized(value),
                 created_at=created_at,
@@ -386,17 +393,6 @@ def _stage_manifest_entry(
     return staged
 
 
-def _validate_session_filename(session_id: str) -> None:
-    if (
-        session_id in {".", ".."}
-        or len(session_id) > 200
-        or _SAFE_SESSION_ID.fullmatch(session_id) is None
-    ):
-        raise LabelJobError(
-            "real session_id contains characters unsafe for a trajectory filename"
-        )
-
-
 def _assign_output_paths(
     trajectories: list[_StagedTrajectory],
 ) -> list[_StagedTrajectory]:
@@ -412,7 +408,6 @@ def _assign_output_paths(
                 raise LabelJobError("synthesized session must use no_session_id")
             sessionless.append(item)
         else:
-            _validate_session_filename(item.session_id)
             real_sessions[item.session_id].append(item)
 
     assigned: list[_StagedTrajectory] = []
@@ -428,11 +423,17 @@ def _assign_output_paths(
                 )
             sub_session_id = item.existing_sub_session_id if modern else index
             assert sub_session_id is not None
+            try:
+                output_path = session_filename(session_id, sub_session_id)
+            except ValueError as error:
+                raise LabelJobError(
+                    "real session_id cannot be encoded as a trajectory filename"
+                ) from error
             assigned.append(
                 replace(
                     item,
                     sub_session_id=sub_session_id,
-                    output_path=f"{session_id}_sub_{sub_session_id}.jsonl",
+                    output_path=output_path,
                 )
             )
 
@@ -695,6 +696,9 @@ def _run_s3_label_job_with_client(
     if not input_report.valid:
         detail = input_report.errors[0] if input_report.errors else "unknown error"
         raise LabelJobError(f"normalized input failed validation: {detail}")
+    input_manifest = orjson.loads(manifest_bytes)
+    sessionless_window_hours = input_manifest.get("sessionless_window_hours") or 0
+    sessionless_partitioning = input_manifest.get("sessionless_partitioning")
     # Verify output listing access before any model calls. Existing flat objects
     # remain in place until the replacement manifest has been published. Do not
     # read the old output manifest: some S3-compatible stores return AccessDenied
@@ -726,6 +730,7 @@ def _run_s3_label_job_with_client(
                     entry,
                     stage_root,
                     len(staged),
+                    sessionless_window_hours=sessionless_window_hours,
                 )
             )
         assigned = _assign_output_paths(staged)
@@ -811,6 +816,11 @@ def _run_s3_label_job_with_client(
             raise LabelJobError("classification candidate counts do not reconcile")
         output_manifest = {
             "schema_version": "trajfoundry-classification-v1",
+            **({"sessionless_window_hours": 8} if sessionless_window_hours else {}),
+            **(
+                {"sessionless_partitioning": sessionless_partitioning}
+                if sessionless_partitioning else {}
+            ),
             "created_at": datetime.now(UTC).isoformat(),
             "input_root": input_location.uri,
             "input_manifest_sha256": manifest_sha256,
