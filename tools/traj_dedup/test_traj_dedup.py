@@ -449,6 +449,8 @@ class DeterminismTests(unittest.TestCase):
                     "n_messages",
                     "is_subagent",
                     "audit_tag",
+                    "extra_tool_tag",
+                    "split",
                     "merged",
                 },
             )
@@ -1130,6 +1132,386 @@ def _ref_desens_equiv(x, y, rx, max_frag):
         return False
 
     return f(0, 0)
+
+
+# ----------------------------------------------------------------------------- 额外工具分流
+
+
+def with_extra(obj, tag=None, tools=None):
+    """给合成记录加 extra_tool_tag / extra_tools（None 表示不写该字段）。"""
+    if tag is not None:
+        obj["extra_tool_tag"] = tag
+    if tools is not None:
+        obj["extra_tools"] = tools
+    return obj
+
+
+def tool(name, kind, calls=0):
+    return {
+        "name": name,
+        "server": "srv" if kind == "mcp" else None,
+        "kind": kind,
+        "call_count": calls,
+        "declaration": "decl",
+    }
+
+
+def split_specs():
+    """每条记录各占一个会话，互不去重；返回 [(名字, 记录)]。"""
+    cases = {
+        "none": {"tag": "none", "tools": []},
+        "unk": {"tag": "declared_only", "tools": [tool("Foo", "unknown")]},
+        "mcp0": {"tag": "declared_only", "tools": [tool("m0", "mcp")]},
+        "mcpc": {"tag": "called", "tools": [tool("m1", "mcp", 3)]},
+        "mix": {
+            "tag": "called",
+            "tools": [tool("Foo", "unknown", 2), tool("m0", "mcp")],
+        },
+        "fb": {"tools": [tool("m1", "mcp", 1)]},  # 没有 tag：退回看 extra_tools
+        "fbnone": {"tools": []},
+        "absent": {},
+    }
+    return [
+        (name, with_extra(rec(f"S_{name}", T0, [SYS(), U(name)]), **kw))
+        for name, kw in cases.items()
+    ]
+
+
+EXPECTED_EXTRA = {
+    "tag": {"unk", "mcp0", "mcpc", "mix", "fb"},
+    "mcp": {"mcp0", "mcpc", "mix", "fb"},
+    "mcp-called": {"mcpc", "fb"},
+    "off": set(),
+}
+ALL_NAMES = {name for name, _ in split_specs()}
+
+
+def names_of(keys):
+    return {os.path.basename(k).split("_sub_")[0] for k in keys}
+
+
+def tree_of(root):
+    out = {}
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            path = os.path.join(dp, fn)
+            with open(path, "rb") as f:
+                out[os.path.relpath(path, root).replace(os.sep, "/")] = f.read()
+    return out
+
+
+class ExtraSplitTests(unittest.TestCase):
+    def test_modes_classify_kept_records(self):
+        res, _ = pipeline(split_specs(), desens=False)
+        for mode, expect in EXPECTED_EXTRA.items():
+            main_keys, extra_keys = td.split_keys(res, "conversation", mode)
+            self.assertEqual(names_of(extra_keys), expect, mode)
+            self.assertEqual(names_of(main_keys), ALL_NAMES - expect, mode)
+            self.assertEqual(main_keys, sorted(main_keys))
+        with self.assertRaises(ValueError):
+            td.split_keys(res, "conversation", "bogus")
+
+    def test_missing_tag_falls_back_to_extra_tools_and_absent_is_counted(self):
+        res, _ = pipeline(split_specs(), desens=False)
+        tags = {names_of([k]).pop(): r.extra_tag for k, r in res.recs.items()}
+        self.assertEqual(
+            tags,
+            {
+                "none": "none",
+                "unk": "declared_only",
+                "mcp0": "declared_only",
+                "mcpc": "called",
+                "mix": "called",
+                "fb": "called",
+                "fbnone": "none",
+                "absent": "absent",
+            },
+        )
+
+    def test_render_structure_and_summary(self):
+        res, _ = pipeline(split_specs(), desens=False)
+        keys = [key_of(n) for n, _ in split_specs()]
+        for level in ("conversation", "snapshot"):
+            for mode, expect in EXPECTED_EXTRA.items():
+                out = td.render(res, level, keys, {"src": "mem"}, None, None, mode)
+                base = {"kept.jsonl", "dropped.jsonl", "buckets.jsonl", "summary.json"}
+                self.assertEqual(
+                    set(out),
+                    base if mode == "off" else base | {"extra_tools/kept.jsonl"},
+                )
+                main_rows = [json.loads(x) for x in out["kept.jsonl"].splitlines()]
+                extra_rows = [
+                    json.loads(x)
+                    for x in out.get("extra_tools/kept.jsonl", "").splitlines()
+                ]
+                self.assertEqual(
+                    {r["split"] for r in main_rows}, {"main"} if main_rows else set()
+                )
+                self.assertEqual(
+                    {r["split"] for r in extra_rows},
+                    {"extra_tools"} if extra_rows else set(),
+                )
+                self.assertTrue(
+                    all("extra_tool_tag" in r for r in main_rows + extra_rows)
+                )
+                self.assertEqual(names_of(r["key"] for r in extra_rows), expect)
+                self.assertEqual(
+                    names_of(r["key"] for r in main_rows + extra_rows), ALL_NAMES
+                )
+                summ = json.loads(out["summary.json"])
+                self.assertEqual(summ["params"]["extra_split"], mode)
+                self.assertEqual(summ["extra_split"]["mode"], mode)
+                st = summ["extra_split"][level]
+                self.assertEqual(
+                    (st["main"], st["extra_tools"]), (len(main_rows), len(extra_rows))
+                )
+
+    def test_summary_numbers_for_tag_mode(self):
+        res, _ = pipeline(split_specs(), desens=False)
+        keys = [key_of(n) for n, _ in split_specs()]
+        out = td.render(res, "conversation", keys, {"src": "mem"}, None, None, "tag")
+        st = json.loads(out["summary.json"])["extra_split"]["conversation"]
+        self.assertEqual(
+            st,
+            {
+                "main": 3,
+                "extra_tools": 5,
+                "absent": 1,
+                "with_mcp": 4,
+                "with_mcp_called": 2,
+                "tags": {"absent": 1, "called": 3, "declared_only": 2, "none": 2},
+                "main_tags": {"absent": 1, "none": 2},
+                "extra_tools_tags": {"called": 3, "declared_only": 2},
+            },
+        )
+
+    def test_dedup_is_independent_of_split_mode(self):
+        res, _ = pipeline(split_specs(), desens=False)
+        keys = [key_of(n) for n, _ in split_specs()]
+        outs = {
+            m: td.render(res, "conversation", keys, {"src": "mem"}, None, None, m)
+            for m in EXPECTED_EXTRA
+        }
+        for m in EXPECTED_EXTRA:
+            self.assertEqual(outs[m]["dropped.jsonl"], outs["off"]["dropped.jsonl"])
+            self.assertEqual(outs[m]["buckets.jsonl"], outs["off"]["buckets.jsonl"])
+            summ = json.loads(outs[m]["summary.json"])
+            self.assertEqual(summ["level2_conversation_remaining"], len(ALL_NAMES))
+
+    def test_split_uses_the_kept_record_own_fields(self):
+        # 同一对话两个快照：更早的有额外工具、保留的最后一版没有 -> 留在 main
+        early = with_extra(
+            rec("S1", T0, [SYS(), U("q")]), tag="called", tools=[tool("m1", "mcp", 2)]
+        )
+        late = with_extra(
+            rec("S1", T1, [SYS(), U("q"), A("a"), U("more")]), tag="none", tools=[]
+        )
+        res, _ = pipeline([("early", early), ("late", late)], desens=False)
+        main_keys, extra_keys = td.split_keys(res, "conversation", "tag")
+        self.assertEqual((names_of(main_keys), extra_keys), ({"late"}, []))
+
+    def test_extra_split_is_deterministic(self):
+        specs = split_specs()
+        outs = []
+        for seed, workers in ((0, 1), (1, 4), (2, 16)):
+            sh = list(specs)
+            random.Random(seed).shuffle(sh)
+            res, stats = pipeline(sh, workers=workers)
+            outs.append(
+                td.render(
+                    res,
+                    "conversation",
+                    [key_of(k) for k, _ in sh],
+                    {"src": "mem"},
+                    None,
+                    stats,
+                    "tag",
+                )
+            )
+        self.assertEqual(outs[1], outs[0])
+        self.assertEqual(outs[2], outs[0])
+
+    def test_cli_writes_split_directories(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            tempfile.TemporaryDirectory() as dst,
+        ):
+            os.makedirs(os.path.join(root, "m", "dt=1"))
+            for name, obj in split_specs():
+                with open(
+                    os.path.join(root, "m", "dt=1", f"{name}_sub_0.jsonl"), "w"
+                ) as f:
+                    f.write(json.dumps(obj) + "\n")
+            out = os.path.join(dst, "default")
+            self.assertEqual(td.main(["--src", root, "--out", out]), 0)
+            tree = tree_of(out)
+            self.assertEqual(
+                set(tree),
+                {
+                    "kept.jsonl",
+                    "dropped.jsonl",
+                    "buckets.jsonl",
+                    "summary.json",
+                    "extra_tools/kept.jsonl",
+                },
+            )
+            self.assertEqual(len(tree["extra_tools/kept.jsonl"].splitlines()), 5)
+            self.assertEqual(len(tree["kept.jsonl"].splitlines()), 3)
+            out = os.path.join(dst, "mcp")
+            self.assertEqual(
+                td.main(["--src", root, "--out", out, "--extra-split", "mcp"]), 0
+            )
+            self.assertEqual(
+                len(tree_of(out)["extra_tools/kept.jsonl"].splitlines()), 4
+            )
+            out = os.path.join(dst, "off")
+            self.assertEqual(
+                td.main(["--src", root, "--out", out, "--extra-split", "off"]), 0
+            )
+            self.assertEqual(
+                set(tree_of(out)),
+                {"kept.jsonl", "dropped.jsonl", "buckets.jsonl", "summary.json"},
+            )
+            self.assertFalse(os.path.exists(os.path.join(out, "extra_tools")))
+            self.assertEqual(len(tree_of(out)["kept.jsonl"].splitlines()), 8)
+
+    def test_copy_kept_sends_extra_records_under_extra_tools(self):
+        calls = []
+
+        class Fake:
+            def copy_object(self, Bucket, Key, CopySource):
+                calls.append((Bucket, Key, CopySource["Bucket"], CopySource["Key"]))
+
+        td.copy_kept(
+            Fake(),
+            "src-b",
+            "a/b/",
+            "s3://dst-b/out",
+            ["a/b/m/dt=1/x_sub_0.jsonl"],
+            2,
+            ["a/b/m/dt=1/y_sub_0.jsonl"],
+        )
+        self.assertEqual(
+            sorted(calls),
+            [
+                (
+                    "dst-b",
+                    "out/extra_tools/m/dt=1/y_sub_0.jsonl",
+                    "src-b",
+                    "a/b/m/dt=1/y_sub_0.jsonl",
+                ),
+                (
+                    "dst-b",
+                    "out/m/dt=1/x_sub_0.jsonl",
+                    "src-b",
+                    "a/b/m/dt=1/x_sub_0.jsonl",
+                ),
+            ],
+        )
+        with self.assertRaises(SystemExit):
+            td.copy_kept(
+                Fake(),
+                "src-b",
+                "a/b/",
+                "s3://src-b/a/b/kept/",
+                [],
+                2,
+                ["a/b/m/dt=1/y_sub_0.jsonl"],
+            )
+        self.assertEqual(
+            td.S3Source(None, "b", "p/").rel("p/x/dt=1/a_sub_0.jsonl"),
+            "x/dt=1/a_sub_0.jsonl",
+        )
+
+
+class ExtraExportTests(unittest.TestCase):
+    def test_export_writes_original_bytes_into_split_directories(self):
+        src = td.MemorySource({key_of(n): o for n, o in split_specs()})
+        res, _, _ = td.run_pipeline(src, desens=False)
+        main_keys, extra_keys = td.split_keys(res, "conversation", "tag")
+        with tempfile.TemporaryDirectory() as dst:
+            n, nbytes = td.export_kept(
+                src, dst, main_keys, extra_keys, dict(src.list())
+            )
+            tree = tree_of(dst)
+        expect = {k: src.read(k) for k in main_keys}
+        expect.update({f"extra_tools/{k}": src.read(k) for k in extra_keys})
+        self.assertEqual(tree, expect)
+        self.assertEqual((n, nbytes), (len(expect), sum(map(len, expect.values()))))
+        self.assertEqual(len(extra_keys), 5)
+        self.assertFalse(any(name.endswith(".part") for name in tree))
+
+    def test_export_refuses_overlapping_directories(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "src")
+            os.makedirs(os.path.join(root, "m", "dt=1"))
+            with open(os.path.join(root, "m", "dt=1", "x_sub_0.jsonl"), "w") as f:
+                f.write(json.dumps(rec("S", T0, [SYS(), U("q")])) + "\n")
+            src = td.LocalSource(root)
+            before = tree_of(parent)
+            keys = [k for k, _ in src.list()]
+            for bad in (root, os.path.join(root, "out"), parent):
+                with self.assertRaises(SystemExit):
+                    td.export_kept(src, bad, keys)
+            with self.assertRaises(SystemExit):
+                td.main(
+                    [
+                        "--src",
+                        root,
+                        "--out",
+                        os.path.join(parent, "o"),
+                        "--export-dir",
+                        os.path.join(root, "x"),
+                    ]
+                )
+            self.assertEqual(tree_of(parent), before)
+
+    def test_export_refuses_unsafe_relative_paths(self):
+        src = td.MemorySource(
+            {"a/../b/dt=1/x_sub_0.jsonl": rec("S", T0, [SYS(), U("q")])}
+        )
+        with tempfile.TemporaryDirectory() as dst:
+            with self.assertRaises(ValueError):
+                td.export_kept(src, dst, [k for k, _ in src.list()])
+            self.assertEqual(tree_of(dst), {})
+
+    def test_cli_export_dir_end_to_end(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            tempfile.TemporaryDirectory() as dst,
+        ):
+            os.makedirs(os.path.join(root, "m", "dt=1"))
+            raw = {}
+            for name, obj in split_specs():
+                rel = f"m/dt=1/{name}_sub_0.jsonl"
+                raw[rel] = (
+                    json.dumps(obj, indent=1) + "\n"
+                ).encode()  # 非规范化格式，验证原样字节
+                with open(os.path.join(root, rel), "wb") as f:
+                    f.write(raw[rel])
+            self.assertEqual(
+                td.main(
+                    [
+                        "--src",
+                        root,
+                        "--out",
+                        os.path.join(dst, "o"),
+                        "--export-dir",
+                        os.path.join(dst, "exp"),
+                    ]
+                ),
+                0,
+            )
+            tree = tree_of(os.path.join(dst, "exp"))
+            expect = {
+                (
+                    f"extra_tools/{k}"
+                    if names_of([k]).pop() in EXPECTED_EXTRA["tag"]
+                    else k
+                ): v
+                for k, v in raw.items()
+            }
+            self.assertEqual(tree, expect)
 
 
 class DesensPropertyTests(unittest.TestCase):

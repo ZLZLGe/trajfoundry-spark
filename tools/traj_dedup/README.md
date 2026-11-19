@@ -26,14 +26,23 @@ python3 tools/traj_dedup/traj_dedup.py --src /path/to/normalized --out runs/<nam
 
 只处理 key 形如 `.../dt=<日期>/<session>_sub_<n>.jsonl` 的文件。`--level snapshot` 只输出第一级结果，默认是第二级；`--copy-to s3://...` 可以把保留的记录在服务端复制到新前缀。对象只在内存里解析，不落盘。
 
+## 额外工具分流
+
+有些记录声明或调用了数据集标准工具之外的工具（比如 MCP 工具）。去重结束后，脚本默认把这类保留记录分到 `<out>/extra_tools/kept.jsonl`，其余的留在 `<out>/kept.jsonl`，两个文件的每一行都带 `extra_tool_tag` 和 `split`（`main` 或 `extra_tools`）。分流只作用在去重之后的保留记录上，按每条保留记录自己的字段判断，去重的规则和结果完全不受影响。
+
+判断依据是记录里的 `extra_tool_tag`（`none`、`declared_only`、`called`）和 `extra_tools`（每个条目有 `name`、`server`、`kind`、`call_count`、`declaration`，`kind` 为 `mcp` 或 `unknown`）。`extra_tool_tag` 缺失时退回看 `extra_tools` 是否非空，两个字段都没有的记为 `absent`，不分出去，在 summary 里单独计数。`--extra-split` 选口径：`tag`（默认）是 `extra_tool_tag` 不为 `none` 就分出去，声明和调用、`mcp` 和 `unknown` 都算；`mcp` 是 `extra_tools` 里有 `kind` 为 `mcp` 的条目；`mcp-called` 是有 `kind` 为 `mcp` 且 `call_count` 大于 0 的条目；`off` 是不分，也不建子目录。
+
+`--copy-to` 会把分出去的记录复制到 `<dest>/extra_tools/<相对路径>`。想把保留的原始对象落到本地目录时用 `--export-dir DIR`：保留的对象原样字节写到 `DIR/<相对路径>`，分出去的写到 `DIR/extra_tools/<相对路径>`。这个选项会重新读取保留的对象，逐个写完即丢弃，只建议在自己的机器上用；`DIR` 和本地源目录互相包含时，或者相对路径里有 `..` 时，脚本会拒绝执行。
+
 ## 输出
 
 `--out` 目录里只有元数据（key、会话 id、时间、计数、哈希），没有消息正文，所有文件按 key 排序。同一输入两次运行的输出逐字节相同。
 
-- `kept.jsonl`：保留的记录，含所属对话、消息数、`normalization_audit.tag` 和它代表了多少条输入。
+- `kept.jsonl`：保留的记录（开了分流时只含留在主目录的那部分），含所属对话、消息数、`normalization_audit.tag`、`extra_tool_tag`、`split` 和它代表了多少条输入。
+- `extra_tools/kept.jsonl`：分流出去的保留记录，字段相同；`--extra-split off` 时不生成。
 - `dropped.jsonl`：删除的记录，含规则、所在级别、直接参照（witness）、最终代表它的记录，以及这次删除是否依赖脱敏等价。
 - `buckets.jsonl`：每个会话或分桶的输入数和两级剩余数。
-- `summary.json`：各规则删除数、两级剩余数、按 audit tag 的分布、脱敏合并统计和输入 key 列表的哈希。
+- `summary.json`：各规则删除数、两级剩余数、按 audit tag 的分布、脱敏合并统计、分流统计（两级各自两侧的条数、`extra_tool_tag` 分布、`absent` 数）和输入 key 列表的哈希。
 
 ## 测试
 
@@ -43,4 +52,4 @@ python -m pytest tools/traj_dedup -q
 
 ## 实测
 
-SXF 分类子集 6,981 条：第一级剩 4,151 条（被弃用的回答 2,641、兄弟回答 139、前缀 50，其中依赖脱敏等价的 50），第二级剩 2,512 条。`--procs 6` 约 110 秒，两次运行输出完全一致。
+SXF 分类子集 6,981 条：第一级剩 4,151 条（被弃用的回答 2,641、兄弟回答 139、前缀 50，其中依赖脱敏等价的 50），第二级剩 2,512 条。`--procs 6` 约 110 秒，两次运行输出完全一致。按默认口径，第二级的 2,512 条里 2,069 条留在主目录，443 条分到 `extra_tools`（`called` 167、`declared_only` 276）；其中含 MCP 额外工具的 279 条，含被调用过的 MCP 工具的 97 条，所以 `--extra-split mcp` 分出 279 条。

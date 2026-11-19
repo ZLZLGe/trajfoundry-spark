@@ -12,7 +12,7 @@
   ``(^|/)dt=[^/]+/[^/]+_sub_\\d+\\.jsonl$`` 的对象（本地目录用相对路径当 key，规则相同），
   其他对象（``_pipeline/``、``manifest.json`` 等）一律跳过。记录字段：``messages``、
   ``metadata.session_id``、``metadata.created_at``、``completeness.is_subagent``、
-  ``normalization_audit.tag``。S3 对象一律 get_object 读进内存、处理后丢弃，
+  ``normalization_audit.tag``，以及分流用的 ``extra_tool_tag``、``extra_tools``（可缺省）。S3 对象一律 get_object 读进内存、处理后丢弃，
   不向本机或服务器磁盘写任何轨迹内容。
 
 【消息 token】
@@ -80,6 +80,21 @@
   每个对话保留 created_at 最晚的一条（再消息数多、再 key 小），其余删，规则 same_conversation，
   witness=保留的那条。
 
+【额外工具分流（--extra-split，默认 tag）】
+  有些记录带“额外工具”（声明或调用了数据集标准工具之外的工具，例如 MCP 工具）。分流只作用于去重之后的
+  保留记录，按每条保留记录自身的字段判断，去重逻辑完全不变。字段：``extra_tool_tag``（none / declared_only /
+  called）和 ``extra_tools``（元素键 name/server/kind/call_count/declaration，kind 为 mcp 或 unknown）。
+  extra_tool_tag 缺失时退回看 extra_tools 是否非空（非空记为 called 或 declared_only，空列表记为 none）；
+  两个字段都没有记为 absent（不分出去，summary 里单独计数）。
+  --extra-split 取值：tag（默认：extra_tool_tag 不是 none 就分出去，声明或调用、mcp 或 unknown 都算）、
+  mcp（extra_tools 里有 kind==mcp 的条目）、mcp-called（有 kind==mcp 且 call_count>0 的条目）、
+  off（不分，也不建子目录）。
+  输出：<out>/kept.jsonl 只放不分出去的保留记录，<out>/extra_tools/kept.jsonl 放分出去的（非 off 时即使为空也会写），
+  两份的每行都有 extra_tool_tag 和 split（main/extra_tools）。--copy-to 把分出去的复制到
+  <dest>/extra_tools/<相对路径>。--export-dir DIR（默认不开）把保留对象原样字节写到 DIR/<相对路径>，
+  分出去的写到 DIR/extra_tools/<相对路径>：需要重新读取保留对象，逐个写完即丢弃；DIR 与本地源目录互相包含时
+  拒绝；相对路径含空段、. 或 .. 时拒绝。这个选项是给使用者在自己机器上用的，脚本的测试只用内存和临时目录验证。
+
 【用法】
   python3 traj_dedup.py --src s3://<bucket>/<prefix>/ --endpoint-url http://<s3-endpoint> --out runs/xxx
   python3 traj_dedup.py --src /path/to/local/dir --out runs/yyy --level snapshot --no-desens
@@ -88,7 +103,7 @@
         和 dropped.jsonl 用哪一级，summary 两级都给）、--out、--no-desens、--placeholder-regex、
         --copy-to s3://...（可选，服务端 copy_object 复制保留记录并保持相对路径；默认不做，
         也绝不写 S3 的其他内容）、--skip-bad（读不了/解析不了的对象记入 summary.skipped 后继续，
-        默认遇到就失败退出）、--mem-budget-gb。
+        默认遇到就失败退出）、--mem-budget-gb，以及分流参数 --extra-split {tag,mcp,mcp-called,off}、--export-dir。
   S3 用 list_objects（v1，Marker 分页）、path-style 寻址、绕过环境里的 http_proxy；
   凭据按 boto3 默认凭据链取（环境变量或 --profile），脚本里不含任何凭据。依赖：标准库，
   读 S3 时才导入 boto3。Python >= 3.10。
@@ -96,7 +111,11 @@
 
 【输出（--out DIR，只含元数据：key、会话 id、时间、计数、哈希，没有消息正文；所有文件按 key 排序）】
   kept.jsonl     key、bucket、conversation、created_at、n_messages、is_subagent、audit_tag、
+                 extra_tool_tag、split（main/extra_tools）、
                  merged（被它代表的输入条数，含自身，所以全部保留记录的 merged 之和等于输入条数）。
+                 分流开启（--extra-split 不是 off）时只放 split 为 main 的保留记录。
+  extra_tools/kept.jsonl
+                 split 为 extra_tools 的保留记录，字段同 kept.jsonl（--extra-split off 时不生成）。
   dropped.jsonl  key、bucket、rule（duplicate/prefix/abandoned_answer/sibling_answer/same_conversation）、
                  level（该记录是在哪一级被删的）、witness（直接 witness）、root（最终代表它的保留记录）、
                  desens（布尔：这条删除只有在脱敏等价下才成立，即这条记录和它的直接 witness 在未合并脱敏
@@ -108,7 +127,9 @@
                  按 normalization_audit.tag 分的剩余数、最大的 10 个桶、参数（含 desens 开关和占位符正则）、
                  脱敏统计（候选 token 对数、核验为等价的对数、被并入代表的 token 数、涉及记录数=含有任一等价组 token 的记录、
                  被改写记录数=token 序列被换成代表的记录）、
-                 输入 key 列表的 sha256、脚本版本、跳过的对象。
+                 输入 key 列表的 sha256、脚本版本、跳过的对象；extra_split：分流口径，以及两级各自
+                 main/extra_tools 条数、extra_tool_tag 分布（总体和两侧各自）、absent 数、含 mcp 额外工具的条数、
+                 含被调用 mcp 额外工具的条数。
 
 【确定性】
   所有选择都走全序比较（created_at 解析为纳秒整数后比较，缺失/无法解析视为最早；最后一级始终是 key），
@@ -127,6 +148,8 @@
     不同子代理若恰好收到相同的第一条 user 消息会被合并。
   * assistant 的 content 为 None 与 "" 视为不同（不做猜测性规范化）；arguments 字符串只原样比较。
   * created_at 缺失或无法解析的记录视为最早，不会因此出错但会优先被替换。
+  * 分流按保留下来的那一条记录自身的字段判断：同一对话更早的快照里有过额外工具、但保留的最后一版没有，
+    这个对话仍留在 main；反过来亦然。
 """
 
 from __future__ import annotations
@@ -164,6 +187,8 @@ DEFAULT_PLACEHOLDER_REGEX = (
     r"<[A-Z][A-Z0-9_]{1,40}>|\[(?:USER|REDACTED|TMP|[A-Z0-9_]*_REDACTED)\]|\*{4,}"
 )
 PLACEHOLDER_RE = re.compile(DEFAULT_PLACEHOLDER_REGEX)
+EXTRA_SPLITS = ("tag", "mcp", "mcp-called", "off")
+EXTRA_DIR = "extra_tools"  # 分流出去的保留记录所在的子目录名
 MAX_FRAGMENT = 256  # 一个占位符最多替换另一边的字符数
 TEXT_CHUNK_CHARS = 64_000_000  # 核验时同时放在内存里的消息文本字符数上限
 
@@ -239,6 +264,60 @@ def _h64(text):
     )
 
 
+def _called(entry):
+    n = entry.get("call_count")
+    return isinstance(n, (int, float)) and not isinstance(n, bool) and n > 0
+
+
+def _extra_tool_info(obj):
+    """(extra_tool_tag, 是否含 mcp 额外工具, 是否含被调用过的 mcp 额外工具)。
+
+    extra_tool_tag 缺失（或为空）时退回看 extra_tools：非空记为 called（有条目被调用过）或 declared_only，
+    空列表记为 none；两个字段都没有记为 absent。"""
+    tag = obj.get("extra_tool_tag")
+    tools = obj.get("extra_tools")
+    entries = (
+        [t for t in tools if isinstance(t, dict)] if isinstance(tools, list) else []
+    )
+    mcp = [t for t in entries if t.get("kind") == "mcp"]
+    if isinstance(tag, str) and tag:
+        etag = tag
+    elif isinstance(tools, list):
+        if not tools:
+            etag = "none"
+        else:
+            etag = "called" if any(_called(t) for t in entries) else "declared_only"
+    else:
+        etag = "absent"
+    return etag, bool(mcp), any(_called(t) for t in mcp)
+
+
+def split_of(r, mode):
+    """保留记录归哪边：main 或 extra_tools（见文件头【额外工具分流】）。"""
+    if mode == "tag":
+        extra = r.extra_tag not in ("none", "absent")
+    elif mode == "mcp":
+        extra = r.extra_mcp
+    elif mode == "mcp-called":
+        extra = r.extra_mcp_called
+    elif mode == "off":
+        extra = False
+    else:
+        raise ValueError(f"unknown extra split mode: {mode!r}")
+    return EXTRA_DIR if extra else "main"
+
+
+def split_keys(res, level, mode):
+    """级别 level 的保留记录 -> (main 的 key 列表, extra_tools 的 key 列表)，各自按 key 排序。"""
+    keep = res.keep1 if level == "snapshot" else res.keep2
+    main_keys, extra_keys = [], []
+    for k in sorted(keep):
+        (extra_keys if split_of(res.recs[k], mode) == EXTRA_DIR else main_keys).append(
+            k
+        )
+    return main_keys, extra_keys
+
+
 def extract(obj, rx=None):
     """解析后的 JSON 对象 -> 纯元数据 dict（含每条消息的 sha256 摘要列表）。可在子进程里运行。
     rx 不为 None 时，另为每条消息记下 (role, 是否含占位符, 规范化文本长度, 前 64 字符哈希, 后 64 字符哈希)，不保留正文。"""
@@ -279,7 +358,11 @@ def extract(obj, rx=None):
     sid = md.get("session_id")
     created = md.get("created_at")
     tag = audit.get("tag")
+    extra_tag, extra_mcp, extra_mcp_called = _extra_tool_info(obj)
     return {
+        "extra_tag": extra_tag,
+        "extra_mcp": extra_mcp,
+        "extra_mcp_called": extra_mcp_called,
         "digests": digests,
         "infos": infos if rx is not None else None,
         "tail": tail,
@@ -323,6 +406,9 @@ class Rec:
         "bucket",
         "created",
         "created_raw",
+        "extra_mcp",
+        "extra_mcp_called",
+        "extra_tag",
         "first_user",
         "fx_end",
         "fx_hash",
@@ -373,6 +459,9 @@ def make_record(key, ex, interner):
     r.created_raw = ex["created_raw"]
     r.is_sub = ex["is_sub"]
     r.tag = ex["tag"]
+    r.extra_tag = ex["extra_tag"]
+    r.extra_mcp = ex["extra_mcp"]
+    r.extra_mcp_called = ex["extra_mcp_called"]
     r.tail = ex["tail"]
     r.last_nonasst = ex["last_nonasst"]
     r.u = ex["u"]
@@ -843,15 +932,50 @@ def _tag_name(t):
     return t if t is not None else "(none)"
 
 
-def render(res, level, input_keys, params=None, skipped=None, desens_stats=None):
-    """返回 {文件名: 文本}，全部按 key 排序，不含时间戳。"""
+def _split_stats(res, keys, mode):
+    """一级的保留记录按分流口径统计：两侧条数、extra_tool_tag 分布（总体和两侧各自）、absent 数、含 mcp 的条数。"""
+    st = {
+        "main": 0,
+        EXTRA_DIR: 0,
+        "absent": 0,
+        "with_mcp": 0,
+        "with_mcp_called": 0,
+        "tags": {},
+        "main_tags": {},
+        f"{EXTRA_DIR}_tags": {},
+    }
+    for k in keys:
+        r = res.recs[k]
+        side = split_of(r, mode)
+        st[side] += 1
+        st["absent"] += r.extra_tag == "absent"
+        st["with_mcp"] += r.extra_mcp
+        st["with_mcp_called"] += r.extra_mcp_called
+        for d in (st["tags"], st[f"{side}_tags"]):
+            d[r.extra_tag] = d.get(r.extra_tag, 0) + 1
+    return st
+
+
+def render(
+    res,
+    level,
+    input_keys,
+    params=None,
+    skipped=None,
+    desens_stats=None,
+    extra_split="tag",
+):
+    """返回 {文件名: 文本}，全部按 key 排序，不含时间戳。分流开启时多一个 extra_tools/kept.jsonl。"""
+    if extra_split not in EXTRA_SPLITS:
+        raise ValueError(f"unknown extra split mode: {extra_split!r}")
     snap = level == "snapshot"
     keep = res.keep1 if snap else res.keep2
     merged = res.merged1 if snap else res.merged2
-    rows = []
+    rows = {"main": [], EXTRA_DIR: []}
     for k in sorted(keep):
         r = res.recs[k]
-        rows.append(
+        side = split_of(r, extra_split)
+        rows[side].append(
             _line(
                 {
                     "key": k,
@@ -861,11 +985,13 @@ def render(res, level, input_keys, params=None, skipped=None, desens_stats=None)
                     "n_messages": r.n,
                     "is_subagent": r.is_sub,
                     "audit_tag": r.tag,
+                    "extra_tool_tag": r.extra_tag,
+                    "split": side,
                     "merged": merged[k],
                 }
             )
         )
-    kept_txt = "".join(rows)
+    kept_txt = "".join(rows["main"])
     drows = []
     for k in sorted(res.drops1):
         rule, w = res.drops1[k]
@@ -937,7 +1063,12 @@ def render(res, level, input_keys, params=None, skipped=None, desens_stats=None)
     largest = sorted(res.bucket_counts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:10]
     summary = {
         "script_version": VERSION,
-        "params": dict(params or {}, level=level),
+        "params": dict(params or {}, level=level, extra_split=extra_split),
+        "extra_split": {
+            "mode": extra_split,
+            "snapshot": _split_stats(res, res.keep1, extra_split),
+            "conversation": _split_stats(res, res.keep2, extra_split),
+        },
         "input_keys_sha256": hashlib.sha256(
             "\n".join(sorted(input_keys)).encode("utf-8")
         ).hexdigest(),
@@ -965,20 +1096,23 @@ def render(res, level, input_keys, params=None, skipped=None, desens_stats=None)
     summary_txt = (
         json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     )
-    return {
+    files = {
         "kept.jsonl": kept_txt,
         "dropped.jsonl": dropped_txt,
         "buckets.jsonl": bucket_txt,
         "summary.json": summary_txt,
     }
+    if extra_split != "off":
+        files[f"{EXTRA_DIR}/kept.jsonl"] = "".join(rows[EXTRA_DIR])
+    return files
 
 
 def write_outputs(out_dir, files):
     os.makedirs(out_dir, exist_ok=True)
     for name, txt in files.items():
-        with open(
-            os.path.join(out_dir, name), "w", encoding="utf-8", newline="\n"
-        ) as f:
+        path = os.path.join(out_dir, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(txt)
 
 
@@ -1004,6 +1138,9 @@ class LocalSource:
         with open(os.path.join(self.root, key), "rb") as f:
             return f.read()
 
+    def rel(self, key):
+        return key
+
 
 class MemorySource:
     """内存里的 {key: JSON 对象}（测试用）。"""
@@ -1016,6 +1153,9 @@ class MemorySource:
 
     def read(self, key):
         return self.blobs[key]
+
+    def rel(self, key):
+        return key
 
 
 class S3Source:
@@ -1047,6 +1187,9 @@ class S3Source:
                 last = e
                 time.sleep(1 + 2 * attempt)
         raise last
+
+    def rel(self, key):
+        return key.removeprefix(self.prefix)
 
 
 def make_s3_client(endpoint_url, profile, workers):
@@ -1227,7 +1370,8 @@ def run_pipeline(
     return dedup(recs), errors, stats
 
 
-def copy_kept(client, src_bucket, src_prefix, dest_url, keys, workers):
+def copy_kept(client, src_bucket, src_prefix, dest_url, keys, workers, extra_keys=()):
+    """服务端复制保留对象：keys -> <dest>/<相对路径>，extra_keys（分流出去的）-> <dest>/extra_tools/<相对路径>。"""
     dbucket, dprefix = parse_s3_url(dest_url)
     if dprefix and not dprefix.endswith("/"):
         dprefix += "/"
@@ -1235,16 +1379,73 @@ def copy_kept(client, src_bucket, src_prefix, dest_url, keys, workers):
         dprefix.startswith(src_prefix) or src_prefix.startswith(dprefix)
     ):
         raise SystemExit("--copy-to overlaps the source prefix; refusing")
+    jobs = [(k, dprefix + k[len(src_prefix) :]) for k in keys]
+    jobs += [(k, f"{dprefix}{EXTRA_DIR}/{k[len(src_prefix) :]}") for k in extra_keys]
 
-    def one(k):
+    def one(job):
+        k, dest_key = job
         client.copy_object(
             Bucket=dbucket,
-            Key=dprefix + k[len(src_prefix) :],
+            Key=dest_key,
             CopySource={"Bucket": src_bucket, "Key": k},
         )
 
     with cf.ThreadPoolExecutor(workers) as tp:
-        list(tp.map(one, keys))
+        list(tp.map(one, jobs))
+
+
+def _rel_parts(rel):
+    parts = rel.split("/")
+    if not rel or any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"unsafe relative path: {rel!r}")
+    return parts
+
+
+def check_export_dir(src, export_dir):
+    """本地源目录与导出目录互相包含时拒绝，免得写坏源数据。"""
+    src_root = getattr(src, "root", None)
+    if src_root is None:
+        return
+    dst, srcr = os.path.realpath(export_dir), os.path.realpath(src_root)
+    if dst == srcr or dst.startswith(srcr + os.sep) or srcr.startswith(dst + os.sep):
+        raise SystemExit("--export-dir overlaps the source directory; refusing")
+
+
+def export_kept(
+    src,
+    export_dir,
+    main_keys,
+    extra_keys=(),
+    sizes=None,
+    workers=16,
+    budget_bytes=2 << 30,
+):
+    """把保留对象原样字节写到 export_dir/<相对路径>，分流出去的写到 export_dir/extra_tools/<相对路径>。
+    重新读取对象，逐个写完即丢弃；先写 .part 再改名，不留半个文件。返回 (写出的文件数, 字节数)。"""
+    check_export_dir(src, export_dir)
+    base = os.path.realpath(export_dir)
+    jobs = []
+    for sub, keys in (((), main_keys), ((EXTRA_DIR,), extra_keys)):
+        for k in keys:  # 先把所有路径校验完，再开始写
+            jobs.append((k, os.path.join(base, *sub, *_rel_parts(src.rel(k)))))
+    budget, sizes = ByteBudget(budget_bytes), sizes or {}
+
+    def one(job):
+        key, path = job
+        w = budget.acquire(sizes.get(key, 0) + (1 << 20))
+        try:
+            blob = src.read(key)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".part", "wb") as f:
+                f.write(blob)
+            os.replace(path + ".part", path)
+            return len(blob)
+        finally:
+            budget.release(w)
+
+    with cf.ThreadPoolExecutor(workers) as tp:
+        total = sum(tp.map(one, jobs))
+    return len(jobs), total
 
 
 # ----------------------------------------------------------------------------- 命令行
@@ -1278,6 +1479,19 @@ def main(argv=None):
         default=None,
         help="s3://<bucket>/<prefix>/ ：服务端复制保留记录（默认不做）",
     )
+    ap.add_argument(
+        "--extra-split",
+        choices=EXTRA_SPLITS,
+        default="tag",
+        help="带额外工具的保留记录分到 <out>/extra_tools/kept.jsonl："
+        "tag=extra_tool_tag 不是 none（默认）；mcp=含 mcp 额外工具；"
+        "mcp-called=含被调用过的 mcp 额外工具；off=不分",
+    )
+    ap.add_argument(
+        "--export-dir",
+        default=None,
+        help="把保留对象原样字节写到 DIR/<相对路径>，分流出去的写到 DIR/extra_tools/<相对路径>（默认不做）",
+    )
     ap.add_argument("--skip-bad", action="store_true")
     ap.add_argument("--mem-budget-gb", type=float, default=6.0)
     args = ap.parse_args(argv)
@@ -1293,6 +1507,8 @@ def main(argv=None):
         if args.copy_to:
             raise SystemExit("--copy-to needs an s3:// source")
         src = LocalSource(args.src)
+    if args.export_dir:
+        check_export_dir(src, args.export_dir)
     items = src.list()
     log(f"listed {len(items)} trajectory objects ({time.time() - t0:.0f}s)")
     desens = not args.no_desens
@@ -1320,7 +1536,15 @@ def main(argv=None):
         "desens": desens,
         "placeholder_regex": args.placeholder_regex if desens else None,
     }
-    files = render(res, args.level, [k for k, _ in items], params, skipped, stats)
+    files = render(
+        res,
+        args.level,
+        [k for k, _ in items],
+        params,
+        skipped,
+        stats,
+        args.extra_split,
+    )
     write_outputs(args.out, files)
     s = json.loads(files["summary.json"])
     log(
@@ -1328,10 +1552,33 @@ def main(argv=None):
         f"dropped {s['dropped_by_rule']}, via desens {s['dropped_via_desens_total']}, "
         f"level1 {s['level1_snapshot_remaining']}, level2 {s['level2_conversation_remaining']}"
     )
+    main_keys, extra_keys = split_keys(res, args.level, args.extra_split)
+    log(
+        f"extra split ({args.extra_split}): main {len(main_keys)}, "
+        f"{EXTRA_DIR} {len(extra_keys)}"
+    )
     if args.copy_to:
-        keep = sorted(res.keep1 if args.level == "snapshot" else res.keep2)
-        copy_kept(client, src.bucket, src.prefix, args.copy_to, keep, args.workers)
-        log(f"copied {len(keep)} kept objects")
+        copy_kept(
+            client,
+            src.bucket,
+            src.prefix,
+            args.copy_to,
+            main_keys,
+            args.workers,
+            extra_keys,
+        )
+        log(f"copied {len(main_keys) + len(extra_keys)} kept objects")
+    if args.export_dir:
+        n_files, n_bytes = export_kept(
+            src,
+            args.export_dir,
+            main_keys,
+            extra_keys,
+            dict(items),
+            args.workers,
+            int(args.mem_budget_gb * (1 << 30)),
+        )
+        log(f"exported {n_files} kept objects ({n_bytes} bytes)")
     return 0
 
 
